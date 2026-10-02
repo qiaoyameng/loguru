@@ -123,6 +123,7 @@ from ._handler import Handler
 from ._locks_machinery import create_logger_lock
 from ._recattrs import RecordException, RecordFile, RecordLevel, RecordProcess, RecordThread
 from ._simple_sinks import AsyncSink, CallableSink, StandardSink, StreamSink
+from ._suppression import RepeatSuppression
 
 if sys.version_info >= (3, 6):
     from collections.abc import AsyncGenerator
@@ -283,6 +284,7 @@ class Logger:
         diagnose=_defaults.LOGURU_DIAGNOSE,
         enqueue=_defaults.LOGURU_ENQUEUE,
         context=_defaults.LOGURU_CONTEXT,
+        suppression=None,
         catch=_defaults.LOGURU_CATCH,
         **kwargs
     ):
@@ -326,6 +328,10 @@ class Logger:
             Whether errors occurring while sink handles logs messages should be automatically
             caught. If ``True``, an exception message is displayed on |sys.stderr| but the exception
             is not propagated to the caller, preventing your app to crash.
+        suppression : RepeatSuppression, optional
+            A per-sink strategy used to suppress repeated records. The first record is emitted as
+            usual, further records sharing the same fingerprint are counted during a time window,
+            and a summary record is emitted when the window expires or the sink is removed.
         **kwargs
             Additional parameters that are only valid to configure a coroutine or file sink (see
             below).
@@ -1034,6 +1040,12 @@ class Logger:
                 "not: '%s'" % type(context).__name__
             )
 
+        if suppression is not None and not isinstance(suppression, RepeatSuppression):
+            raise TypeError(
+                "Invalid suppression, it should be a RepeatSuppression instance or None, "
+                "not: '%s'" % type(suppression).__name__
+            )
+
         with self._core.lock:
             exception_formatter = ExceptionFormatter(
                 colorize=colorize,
@@ -1055,6 +1067,7 @@ class Logger:
                 serialize=serialize,
                 enqueue=enqueue,
                 multiprocessing_context=context,
+                suppression=suppression,
                 id_=handler_id,
                 error_interceptor=error_interceptor,
                 exception_formatter=exception_formatter,

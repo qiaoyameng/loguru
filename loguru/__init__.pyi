@@ -119,6 +119,15 @@ class Record(TypedDict):
 class Message(str):
     record: Record
 
+class RepeatSuppression:
+    def __init__(
+        self,
+        window: timedelta,
+        max_groups: int = ...,
+        fingerprint: Callable[[Record], Any] = ...,
+        clock: Callable[[], datetime] = ...
+    ) -> None: ...
+
 class Writable(Protocol):
     def write(self, message: Message) -> Any: ...
 
@@ -142,6 +151,7 @@ class BasicHandlerConfig(TypedDict, total=False):
     backtrace: bool
     diagnose: bool
     enqueue: bool
+    suppression: Optional[RepeatSuppression]
     catch: bool
 
 class FileHandlerConfig(TypedDict, total=False):
@@ -154,6 +164,7 @@ class FileHandlerConfig(TypedDict, total=False):
     backtrace: bool
     diagnose: bool
     enqueue: bool
+    suppression: Optional[RepeatSuppression]
     catch: bool
     rotation: Optional[
         Union[
@@ -187,6 +198,7 @@ class AsyncHandlerConfig(TypedDict, total=False):
     backtrace: bool
     diagnose: bool
     enqueue: bool
+    suppression: Optional[RepeatSuppression]
     catch: bool
     context: Optional[Union[str, BaseContext]]
     loop: Optional[AbstractEventLoop]
@@ -216,6 +228,7 @@ class Logger:
         diagnose: bool = ...,
         enqueue: bool = ...,
         context: Optional[Union[str, BaseContext]] = ...,
+        suppression: Optional[RepeatSuppression] = ...,
         catch: bool = ...
     ) -> int: ...
     @overload
@@ -231,6 +244,7 @@ class Logger:
         backtrace: bool = ...,
         diagnose: bool = ...,
         enqueue: bool = ...,
+        suppression: Optional[RepeatSuppression] = ...,
         catch: bool = ...,
         context: Optional[Union[str, BaseContext]] = ...,
         loop: Optional[AbstractEventLoop] = ...
@@ -249,6 +263,7 @@ class Logger:
         diagnose: bool = ...,
         enqueue: bool = ...,
         context: Optional[Union[str, BaseContext]] = ...,
+        suppression: Optional[RepeatSuppression] = ...,
         catch: bool = ...,
         rotation: Optional[
             Union[

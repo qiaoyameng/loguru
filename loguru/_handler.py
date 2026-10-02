@@ -42,6 +42,7 @@ class Handler:
         serialize,
         enqueue,
         multiprocessing_context,
+        suppression,
         error_interceptor,
         exception_formatter,
         id_,
@@ -57,6 +58,7 @@ class Handler:
         self._serialize = serialize
         self._enqueue = enqueue
         self._multiprocessing_context = multiprocessing_context
+        self._suppression = None if suppression is None else suppression.bind()
         self._error_interceptor = error_interceptor
         self._exception_formatter = exception_formatter
         self._id = id_
@@ -133,93 +135,164 @@ class Handler:
                 if not self._filter(record):
                     return
 
-            if self._is_formatter_dynamic:
-                dynamic_format = self._formatter(record)
+            dynamic_format = None
 
-            formatter_record = record.copy()
-
-            if not record["exception"]:
-                formatter_record["exception"] = ""
-            else:
-                type_, value, tb = record["exception"]
-                formatter = self._exception_formatter
-                lines = formatter.format_exception(type_, value, tb, from_decorator=from_decorator)
-                formatter_record["exception"] = "".join(lines)
-
-            if colored_message is not None and colored_message.stripped != record["message"]:
-                colored_message = None
-
-            if is_raw:
-                if colored_message is None or not self._colorize:
-                    formatted = record["message"]
-                else:
-                    ansi_level = self._levels_ansi_codes[level_id]
-                    formatted = colored_message.colorize(ansi_level)
-            elif self._is_formatter_dynamic:
-                if not self._colorize:
-                    precomputed_format = self._memoize_dynamic_format(dynamic_format)
-                    formatted = self._format_record(precomputed_format, formatter_record)
-                elif colored_message is None:
-                    ansi_level = self._levels_ansi_codes[level_id]
-                    _, precomputed_format = self._memoize_dynamic_format(dynamic_format, ansi_level)
-                    formatted = self._format_record(precomputed_format, formatter_record)
-                else:
-                    ansi_level = self._levels_ansi_codes[level_id]
-                    formatter, precomputed_format = self._memoize_dynamic_format(
-                        dynamic_format, ansi_level
-                    )
-                    coloring_message = formatter.make_coloring_message(
-                        record["message"], ansi_level=ansi_level, colored_message=colored_message
-                    )
-                    formatter_record["message"] = coloring_message
-                    formatted = self._format_record(precomputed_format, formatter_record)
-
-            else:
-                if not self._colorize:
-                    precomputed_format = self._decolorized_format
-                    formatted = self._format_record(precomputed_format, formatter_record)
-                elif colored_message is None:
-                    ansi_level = self._levels_ansi_codes[level_id]
-                    precomputed_format = self._precolorized_formats[level_id]
-                    formatted = self._format_record(precomputed_format, formatter_record)
-                else:
-                    ansi_level = self._levels_ansi_codes[level_id]
-                    precomputed_format = self._precolorized_formats[level_id]
-                    coloring_message = self._formatter.make_coloring_message(
-                        record["message"], ansi_level=ansi_level, colored_message=colored_message
-                    )
-                    formatter_record["message"] = coloring_message
-                    formatted = self._format_record(precomputed_format, formatter_record)
-
-            if self._serialize:
-                formatted = self._serialize_record(formatted, record)
-
-            str_record = Message(formatted)
-            str_record.record = record
+            actions = []
 
             with self._protected_lock():
                 if self._stopped:
                     return
-                if self._enqueue:
-                    self._queue.put(str_record)
+
+                records_to_write = []
+
+                if self._suppression is None or record["extra"].get("suppression_summary"):
+                    should_write = True
                 else:
-                    self._sink.write(str_record)
+                    should_write, records_to_write = self._suppression.process(record)
+
+                if should_write:
+                    records_to_write.append(record)
+
+                for record_to_write in records_to_write:
+                    is_summary = record_to_write is not record
+                    actions.append((
+                        record_to_write,
+                        level_id if not is_summary else record_to_write["level"].name,
+                        from_decorator,
+                        is_raw and not is_summary,
+                        None if is_summary else colored_message,
+                        dynamic_format,
+                    ))
+
+            for action in actions:
+                self._write_record(*action)
         except Exception:
             if not self._error_interceptor.should_catch():
                 raise
             self._error_interceptor.print(record)
 
+    def _write_record(
+        self,
+        record,
+        level_id,
+        from_decorator,
+        is_raw,
+        colored_message,
+        dynamic_format,
+        force=False
+    ):
+        if self._is_formatter_dynamic:
+            dynamic_format = self._formatter(record)
+
+        formatter_record = record.copy()
+
+        if not record["exception"]:
+            formatter_record["exception"] = ""
+        else:
+            type_, value, tb = record["exception"]
+            formatter = self._exception_formatter
+            lines = formatter.format_exception(type_, value, tb, from_decorator=from_decorator)
+            formatter_record["exception"] = "".join(lines)
+
+        if colored_message is not None and colored_message.stripped != record["message"]:
+            colored_message = None
+
+        if is_raw:
+            if colored_message is None or not self._colorize:
+                formatted = record["message"]
+            else:
+                ansi_level = self._levels_ansi_codes[level_id]
+                formatted = colored_message.colorize(ansi_level)
+        elif self._is_formatter_dynamic:
+            if not self._colorize:
+                precomputed_format = self._memoize_dynamic_format(dynamic_format)
+                formatted = self._format_record(precomputed_format, formatter_record)
+            elif colored_message is None:
+                ansi_level = self._levels_ansi_codes[level_id]
+                _, precomputed_format = self._memoize_dynamic_format(dynamic_format, ansi_level)
+                formatted = self._format_record(precomputed_format, formatter_record)
+            else:
+                ansi_level = self._levels_ansi_codes[level_id]
+                formatter, precomputed_format = self._memoize_dynamic_format(
+                    dynamic_format, ansi_level
+                )
+                coloring_message = formatter.make_coloring_message(
+                    record["message"], ansi_level=ansi_level, colored_message=colored_message
+                )
+                formatter_record["message"] = coloring_message
+                formatted = self._format_record(precomputed_format, formatter_record)
+        else:
+            if not self._colorize:
+                precomputed_format = self._decolorized_format
+                formatted = self._format_record(precomputed_format, formatter_record)
+            elif colored_message is None:
+                ansi_level = self._levels_ansi_codes[level_id]
+                precomputed_format = self._precolorized_formats[level_id]
+                formatted = self._format_record(precomputed_format, formatter_record)
+            else:
+                ansi_level = self._levels_ansi_codes[level_id]
+                precomputed_format = self._precolorized_formats[level_id]
+                coloring_message = self._formatter.make_coloring_message(
+                    record["message"], ansi_level=ansi_level, colored_message=colored_message
+                )
+                formatter_record["message"] = coloring_message
+                formatted = self._format_record(precomputed_format, formatter_record)
+
+        if self._serialize:
+            formatted = self._serialize_record(formatted, record)
+
+        str_record = Message(formatted)
+        str_record.record = record
+
+        with self._protected_lock():
+            if self._stopped and not force:
+                return
+            self._write_message(str_record)
+
+    def _write_message(self, str_record):
+        if self._enqueue:
+            self._queue.put(str_record)
+        else:
+            self._sink.write(str_record)
+
     def stop(self):
         with self._protected_lock():
+            is_owner_process = (
+                not self._enqueue or self._owner_process_pid == os.getpid()
+            )
+            summary_records = []
+            if self._suppression is not None and is_owner_process:
+                summary_records = self._suppression.close()
+
             self._stopped = True
             if self._enqueue:
-                if self._owner_process_pid != os.getpid():
+                if not is_owner_process:
                     return
-                self._queue.put(None)
-                self._thread.join()
-                if hasattr(self._queue, "close"):
-                    self._queue.close()
 
+        for summary_record in summary_records:
+            try:
+                self._write_record(
+                    summary_record,
+                    summary_record["level"].name,
+                    False,
+                    False,
+                    None,
+                    None,
+                    True,
+                )
+            except Exception:
+                if not self._error_interceptor.should_catch():
+                    raise
+                self._error_interceptor.print(summary_record)
+
+        if self._enqueue:
+            with self._protected_lock():
+                self._queue.put(None)
+            self._thread.join()
+            if hasattr(self._queue, "close"):
+                self._queue.close()
+
+        with self._protected_lock():
             self._sink.stop()
 
     def complete_queue(self):
