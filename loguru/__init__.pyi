@@ -69,6 +69,10 @@ Catcher = NewType("Catcher", _GeneratorContextManager[None])
 Contextualizer = NewType("Contextualizer", _GeneratorContextManager[None])
 AwaitableCompleter = Awaitable[None]
 
+
+class HandlerIds(List[int], Awaitable[None]):
+    def __await__(self): ...
+
 class Level(NamedTuple):
     name: str
     no: int
@@ -319,6 +323,16 @@ class Logger:
     ) -> Level: ...
     def disable(self, name: Optional[str]) -> None: ...
     def enable(self, name: Optional[str]) -> None: ...
+    def reconfigure(
+        self,
+        *,
+        handlers: Optional[Sequence[HandlerConfig]] = ...,
+        levels: Optional[Sequence[LevelConfig]] = ...,
+        extra: Optional[Dict[Any, Any]] = ...,
+        patcher: Optional[PatcherFunction] = ...,
+        activation: Optional[Sequence[ActivationConfig]] = ...
+    ) -> HandlerIds: ...
+    replace = reconfigure
     def configure(
         self,
         *,
@@ -327,7 +341,7 @@ class Logger:
         extra: Optional[Dict[Any, Any]] = ...,
         patcher: Optional[PatcherFunction] = ...,
         activation: Optional[Sequence[ActivationConfig]] = ...
-    ) -> List[int]: ...
+    ) -> HandlerIds: ...
     def reinstall(self) -> None: ...
     # @staticmethod cannot be used with @overload in mypy (python/mypy#7781).
     # However Logger is not exposed and logger is an instance of Logger

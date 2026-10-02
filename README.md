@@ -290,6 +290,9 @@ config = {
 }
 logger.configure(**config)
 
+# configure() and reconfigure() install all new handlers as one generation; a sink
+# initialization failure leaves the previous handlers, levels and extra untouched.
+
 # For libraries, should be your library's `__name__`
 logger.disable("my_library")
 logger.info("No matter added sinks, this message is not displayed")

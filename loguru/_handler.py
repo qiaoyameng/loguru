@@ -3,6 +3,7 @@ import json
 import multiprocessing
 import os
 import threading
+import weakref
 from contextlib import contextmanager
 from threading import Thread
 
@@ -63,8 +64,8 @@ class Handler:
         self._levels_ansi_codes = levels_ansi_codes  # Warning, reference shared among handlers
 
         self._decolorized_format = None
-        self._precolorized_formats = {}
-        self._memoize_dynamic_format = None
+        self._precolorized_formats_by_codes = weakref.WeakKeyDictionary()
+        self._memoize_dynamic_formats_by_codes = weakref.WeakKeyDictionary()
 
         self._stopped = False
         self._lock = create_handler_lock()
@@ -76,12 +77,7 @@ class Handler:
         self._owner_process_pid = None
         self._thread = None
 
-        if self._is_formatter_dynamic:
-            if self._colorize:
-                self._memoize_dynamic_format = memoize(prepare_colored_format)
-            else:
-                self._memoize_dynamic_format = memoize(prepare_stripped_format)
-        else:
+        if not self._is_formatter_dynamic:
             if self._colorize:
                 for level_name in self._levels_ansi_codes:
                     self.update_format(level_name)
@@ -124,7 +120,16 @@ class Handler:
         finally:
             self._lock_acquired.acquired = False
 
-    def emit(self, record, level_id, from_decorator, is_raw, colored_message):
+    def emit(
+        self,
+        record,
+        level_id,
+        from_decorator,
+        is_raw,
+        colored_message,
+        levels_ansi_codes=None,
+    ):
+        ansi_codes = levels_ansi_codes or self._levels_ansi_codes
         try:
             if self._levelno > record["level"].no:
                 return
@@ -153,19 +158,22 @@ class Handler:
                 if colored_message is None or not self._colorize:
                     formatted = record["message"]
                 else:
-                    ansi_level = self._levels_ansi_codes[level_id]
+                    ansi_level = ansi_codes[level_id]
                     formatted = colored_message.colorize(ansi_level)
             elif self._is_formatter_dynamic:
                 if not self._colorize:
-                    precomputed_format = self._memoize_dynamic_format(dynamic_format)
+                    dynamic_formats = self._dynamic_formats(ansi_codes)
+                    precomputed_format = dynamic_formats(dynamic_format)
                     formatted = self._format_record(precomputed_format, formatter_record)
                 elif colored_message is None:
-                    ansi_level = self._levels_ansi_codes[level_id]
-                    _, precomputed_format = self._memoize_dynamic_format(dynamic_format, ansi_level)
+                    ansi_level = ansi_codes[level_id]
+                    dynamic_formats = self._dynamic_formats(ansi_codes)
+                    _, precomputed_format = dynamic_formats(dynamic_format, ansi_level)
                     formatted = self._format_record(precomputed_format, formatter_record)
                 else:
-                    ansi_level = self._levels_ansi_codes[level_id]
-                    formatter, precomputed_format = self._memoize_dynamic_format(
+                    ansi_level = ansi_codes[level_id]
+                    dynamic_formats = self._dynamic_formats(ansi_codes)
+                    formatter, precomputed_format = dynamic_formats(
                         dynamic_format, ansi_level
                     )
                     coloring_message = formatter.make_coloring_message(
@@ -179,12 +187,12 @@ class Handler:
                     precomputed_format = self._decolorized_format
                     formatted = self._format_record(precomputed_format, formatter_record)
                 elif colored_message is None:
-                    ansi_level = self._levels_ansi_codes[level_id]
-                    precomputed_format = self._precolorized_formats[level_id]
+                    ansi_level = ansi_codes[level_id]
+                    precomputed_format = self._precolorized_formats_by_codes[ansi_codes][level_id]
                     formatted = self._format_record(precomputed_format, formatter_record)
                 else:
-                    ansi_level = self._levels_ansi_codes[level_id]
-                    precomputed_format = self._precolorized_formats[level_id]
+                    ansi_level = ansi_codes[level_id]
+                    precomputed_format = self._precolorized_formats_by_codes[ansi_codes][level_id]
                     coloring_message = self._formatter.make_coloring_message(
                         record["message"], ansi_level=ansi_level, colored_message=colored_message
                     )
@@ -222,6 +230,40 @@ class Handler:
 
             self._sink.stop()
 
+    def retire(self):
+        tasks = []
+        complete_tasks = []
+        with self._protected_lock():
+            self._stopped = True
+            if self._enqueue:
+                if self._owner_process_pid != os.getpid():
+                    return [], []
+                self._queue.put(None)
+            else:
+                complete_and_stop = getattr(self._sink, "complete_and_stop", None)
+                if complete_and_stop is not None:
+                    complete_tasks.append(complete_and_stop())
+                else:
+                    tasks.extend(self._sink.tasks_to_complete())
+
+        if self._enqueue:
+            self._thread.join()
+            if hasattr(self._queue, "close"):
+                self._queue.close()
+            complete_and_stop = getattr(self._sink, "complete_and_stop", None)
+            if complete_and_stop is not None:
+                complete_tasks.append(complete_and_stop())
+            else:
+                tasks.extend(self._sink.tasks_to_complete())
+
+        if not tasks and not complete_tasks:
+            self._sink.stop()
+
+        return tasks, complete_tasks
+
+    def finish(self):
+        self._sink.stop()
+
     def complete_queue(self):
         if not self._enqueue:
             return
@@ -241,8 +283,26 @@ class Handler:
     def update_format(self, level_id):
         if not self._colorize or self._is_formatter_dynamic:
             return
+        precolorized_formats = self._precolorized_formats_by_codes.setdefault(
+            self._levels_ansi_codes, {}
+        )
         ansi_code = self._levels_ansi_codes[level_id]
-        self._precolorized_formats[level_id] = self._formatter.colorize(ansi_code)
+        precolorized_format = self._formatter.colorize(ansi_code)
+        precolorized_formats[level_id] = precolorized_format
+
+    def update_levels_ansi_codes(self, levels_ansi_codes):
+        self._levels_ansi_codes = levels_ansi_codes
+        for level_id in levels_ansi_codes:
+            self.update_format(level_id)
+
+    def _dynamic_formats(self, ansi_codes):
+        dynamic_formats = self._memoize_dynamic_formats_by_codes.get(ansi_codes)
+        if dynamic_formats is None:
+            dynamic_formats = memoize(
+                prepare_colored_format if self._colorize else prepare_stripped_format
+            )
+            self._memoize_dynamic_formats_by_codes[ansi_codes] = dynamic_formats
+        return dynamic_formats
 
     @property
     def levelno(self):
@@ -338,7 +398,8 @@ class Handler:
         state = self.__dict__.copy()
         state["_lock"] = None
         state["_lock_acquired"] = None
-        state["_memoize_dynamic_format"] = None
+        state["_precolorized_formats_by_codes"] = None
+        state["_memoize_dynamic_formats_by_codes"] = None
         if self._enqueue:
             state["_sink"] = None
             state["_thread"] = None
@@ -351,8 +412,8 @@ class Handler:
         self._lock_acquired = threading.local()
         if self._enqueue:
             self._queue_lock = create_handler_lock()
-        if self._is_formatter_dynamic:
-            if self._colorize:
-                self._memoize_dynamic_format = memoize(prepare_colored_format)
-            else:
-                self._memoize_dynamic_format = memoize(prepare_stripped_format)
+        self._precolorized_formats_by_codes = weakref.WeakKeyDictionary()
+        self._memoize_dynamic_formats_by_codes = weakref.WeakKeyDictionary()
+        if not self._is_formatter_dynamic:
+            for level_id in self._levels_ansi_codes:
+                self.update_format(level_id)

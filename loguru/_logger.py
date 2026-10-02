@@ -155,6 +155,67 @@ start_time = aware_now()
 context = ContextVar("loguru_context", default={})
 
 
+class Generation:
+    __slots__ = (
+        "handlers",
+        "levels",
+        "levels_ansi_codes",
+        "levels_lookup",
+        "extra",
+        "patcher",
+        "min_level",
+        "enabled",
+        "activation_list",
+        "activation_none",
+        "active",
+        "condition",
+    )
+
+    def __init__(
+        self,
+        *,
+        handlers,
+        levels,
+        levels_ansi_codes,
+        levels_lookup,
+        extra,
+        patcher,
+        min_level,
+        enabled,
+        activation_list,
+        activation_none,
+    ):
+        self.handlers = handlers
+        self.levels = levels
+        self.levels_ansi_codes = levels_ansi_codes
+        self.levels_lookup = levels_lookup
+        self.extra = extra
+        self.patcher = patcher
+        self.min_level = min_level
+        self.enabled = enabled
+        self.activation_list = activation_list
+        self.activation_none = activation_none
+        self.active = 0
+        self.condition = threading.Condition()
+
+
+class LevelsAnsiCodes(dict):
+    __slots__ = ("__weakref__",)
+
+    def __hash__(self):
+        return id(self)
+
+
+class HandlerIds(list):
+    def __init__(self, ids, awaitable=None):
+        super().__init__(ids)
+        self._awaitable = awaitable
+
+    def __await__(self):
+        if self._awaitable is not None:
+            yield from self._awaitable.__await__()
+
+
 class Core:
     def __init__(self):
         levels = [
@@ -202,10 +263,10 @@ class Core:
             ),
         ]
         self.levels = {level.name: level for level in levels}
-        self.levels_ansi_codes = {
-            **{name: Colorizer.ansify(level.color) for name, level in self.levels.items()},
-            None: "",
-        }
+        self.levels_ansi_codes = LevelsAnsiCodes(
+            {name: Colorizer.ansify(level.color) for name, level in self.levels.items()}
+        )
+        self.levels_ansi_codes[None] = ""
 
         # Cache used internally to quickly access level attributes based on their name or severity.
         # It can also contain integers as keys, it serves to avoid calling "isinstance()" repeatedly
@@ -224,20 +285,60 @@ class Core:
         self.enabled = {}
         self.activation_list = []
         self.activation_none = True
+        self.generation = self._make_generation()
 
         self.thread_locals = threading.local()
         self.lock = create_logger_lock()
+
+    def _make_generation(self, **changes):
+        values = {
+            "handlers": self.handlers,
+            "levels": self.levels,
+            "levels_ansi_codes": self.levels_ansi_codes,
+            "levels_lookup": self.levels_lookup,
+            "extra": self.extra,
+            "patcher": self.patcher,
+            "min_level": self.min_level,
+            "enabled": self.enabled,
+            "activation_list": self.activation_list,
+            "activation_none": self.activation_none,
+        }
+        values.update(changes)
+        return Generation(**values)
+
+    def _replace_generation(self, **changes):
+        generation = self._make_generation(**changes)
+        self.handlers = generation.handlers
+        self.levels = generation.levels
+        self.levels_ansi_codes = generation.levels_ansi_codes
+        self.levels_lookup = generation.levels_lookup
+        self.extra = generation.extra
+        self.patcher = generation.patcher
+        self.min_level = generation.min_level
+        self.enabled = generation.enabled
+        self.activation_list = generation.activation_list
+        self.activation_none = generation.activation_none
+        self.generation = generation
+        return generation
+
+    def _wait_generation(self, generation):
+        condition = generation.condition
+        with condition:
+            while generation.active:
+                condition.wait()
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["thread_locals"] = None
         state["lock"] = None
+        state["generation"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.thread_locals = threading.local()
         self.lock = create_logger_lock()
+        self.generation = self._make_generation()
 
 
 class Logger:
@@ -284,6 +385,63 @@ class Logger:
         enqueue=_defaults.LOGURU_ENQUEUE,
         context=_defaults.LOGURU_CONTEXT,
         catch=_defaults.LOGURU_CATCH,
+        levels=None,
+        levels_ansi_codes=None,
+        **kwargs
+    ):
+        with self._core.lock:
+            handler_id = self._core.handlers_count
+            self._core.handlers_count += 1
+
+        try:
+            handler = self._prepare_handler(
+                handler_id,
+                sink,
+                level=level,
+                format=format,
+                filter=filter,
+                colorize=colorize,
+                serialize=serialize,
+                backtrace=backtrace,
+                diagnose=diagnose,
+                enqueue=enqueue,
+                context=context,
+                catch=catch,
+                levels=levels,
+                levels_ansi_codes=levels_ansi_codes,
+                **kwargs
+            )
+        except Exception:
+            with self._core.lock:
+                if self._core.handlers_count == handler_id + 1:
+                    self._core.handlers_count = handler_id
+            raise
+
+        with self._core.lock:
+            handlers = self._core.handlers.copy()
+            handlers[handler_id] = handler
+            min_level = min(self._core.min_level, handler.levelno)
+            self._core._replace_generation(handlers=handlers, min_level=min_level)
+
+        return handler_id
+
+    def _prepare_handler(
+        self,
+        handler_id,
+        sink,
+        *,
+        level=_defaults.LOGURU_LEVEL,
+        format=_defaults.LOGURU_FORMAT,
+        filter=_defaults.LOGURU_FILTER,
+        colorize=_defaults.LOGURU_COLORIZE,
+        serialize=_defaults.LOGURU_SERIALIZE,
+        backtrace=_defaults.LOGURU_BACKTRACE,
+        diagnose=_defaults.LOGURU_DIAGNOSE,
+        enqueue=_defaults.LOGURU_ENQUEUE,
+        context=_defaults.LOGURU_CONTEXT,
+        catch=_defaults.LOGURU_CATCH,
+        levels=None,
+        levels_ansi_codes=None,
         **kwargs
     ):
         r"""Add a handler sending log messages to a sink adequately configured.
@@ -835,9 +993,10 @@ class Logger:
         >>> stream_object = RandomStream(seed=12345, threshold=0.25)
         >>> logger.add(stream_object, level="INFO")
         """
-        with self._core.lock:
-            handler_id = self._core.handlers_count
-            self._core.handlers_count += 1
+        if levels is None:
+            levels = self._core.levels
+        if levels_ansi_codes is None:
+            levels_ansi_codes = self._core.levels_ansi_codes
 
         error_interceptor = ErrorInterceptor(catch, handler_id)
 
@@ -948,8 +1107,13 @@ class Logger:
                     levelno_ = 0
                 elif isinstance(level_, str):
                     try:
-                        levelno_ = self.level(level_).no
+                        levelno_ = levels[level_].no
                     except ValueError:
+                        raise ValueError(
+                            "The filter dict contains a module '%s' associated to a level name "
+                            "which does not exist: '%s'" % (module, level_)
+                        ) from None
+                    except KeyError:
                         raise ValueError(
                             "The filter dict contains a module '%s' associated to a level name "
                             "which does not exist: '%s'" % (module, level_)
@@ -986,7 +1150,10 @@ class Logger:
             )
 
         if isinstance(level, str):
-            levelno = self.level(level).no
+            try:
+                levelno = levels[level].no
+            except KeyError:
+                raise ValueError("Level '%s' does not exist" % level) from None
         elif isinstance(level, int):
             levelno = level
         else:
@@ -1034,40 +1201,31 @@ class Logger:
                 "not: '%s'" % type(context).__name__
             )
 
-        with self._core.lock:
-            exception_formatter = ExceptionFormatter(
-                colorize=colorize,
-                encoding=encoding,
-                diagnose=diagnose,
-                backtrace=backtrace,
-                hidden_frames_filename=self.catch.__code__.co_filename,
-                prefix=exception_prefix,
-            )
+        exception_formatter = ExceptionFormatter(
+            colorize=colorize,
+            encoding=encoding,
+            diagnose=diagnose,
+            backtrace=backtrace,
+            hidden_frames_filename=self.catch.__code__.co_filename,
+            prefix=exception_prefix,
+        )
 
-            handler = Handler(
-                name=name,
-                sink=wrapped_sink,
-                levelno=levelno,
-                formatter=formatter,
-                is_formatter_dynamic=is_formatter_dynamic,
-                filter_=filter_func,
-                colorize=colorize,
-                serialize=serialize,
-                enqueue=enqueue,
-                multiprocessing_context=context,
-                id_=handler_id,
-                error_interceptor=error_interceptor,
-                exception_formatter=exception_formatter,
-                levels_ansi_codes=self._core.levels_ansi_codes,
-            )
-
-            handlers = self._core.handlers.copy()
-            handlers[handler_id] = handler
-
-            self._core.min_level = min(self._core.min_level, levelno)
-            self._core.handlers = handlers
-
-        return handler_id
+        return Handler(
+            name=name,
+            sink=wrapped_sink,
+            levelno=levelno,
+            formatter=formatter,
+            is_formatter_dynamic=is_formatter_dynamic,
+            filter_=filter_func,
+            colorize=colorize,
+            serialize=serialize,
+            enqueue=enqueue,
+            multiprocessing_context=context,
+            id_=handler_id,
+            error_interceptor=error_interceptor,
+            exception_formatter=exception_formatter,
+            levels_ansi_codes=levels_ansi_codes,
+        )
 
     def remove(self, handler_id=None):
         """Remove a previously added handler and stop sending logs to its sink.
@@ -1112,9 +1270,10 @@ class Logger:
 
                 # This needs to be done first in case "stop()" raises an exception
                 levelnos = (h.levelno for h in handlers.values())
-                self._core.min_level = min(levelnos, default=float("inf"))
-                self._core.handlers = handlers
-
+                min_level = min(levelnos, default=float("inf"))
+                self._core._replace_generation(
+                    handlers=handlers, min_level=min_level
+                )
                 handler.stop()
 
     def complete(self):
@@ -1712,11 +1871,21 @@ class Logger:
         level = Level(name, no, color, icon)
 
         with self._core.lock:
-            self._core.levels[name] = level
-            self._core.levels_ansi_codes[name] = ansi
-            self._core.levels_lookup[name] = (name, name, no, icon)
-            for handler in self._core.handlers.values():
-                handler.update_format(name)
+            levels = self._core.levels.copy()
+            levels[name] = level
+            levels_ansi_codes = LevelsAnsiCodes(self._core.levels_ansi_codes)
+            levels_ansi_codes[name] = ansi
+            levels_lookup = self._core.levels_lookup.copy()
+            levels_lookup[name] = (name, name, no, icon)
+            handlers = self._core.handlers
+            self._core._replace_generation(
+                handlers=handlers,
+                levels=levels,
+                levels_ansi_codes=levels_ansi_codes,
+                levels_lookup=levels_lookup,
+            )
+            for handler in handlers.values():
+                handler.update_levels_ansi_codes(levels_ansi_codes)
 
         return level
 
@@ -1767,6 +1936,268 @@ class Logger:
         [22:46:12] Re-enabled, messages are logged.
         """
         self._change_activation(name, True)
+
+    @staticmethod
+    def _raise_errors(errors, message):
+        if not errors:
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        if hasattr(builtins, "BaseExceptionGroup"):
+            raise builtins.BaseExceptionGroup(message, errors)
+        raise RuntimeError(message) from errors[0]
+
+    @staticmethod
+    def _prepare_level(levels, levels_ansi_codes, levels_lookup, params):
+        name = params["name"]
+        no = params.get("no")
+        color = params.get("color")
+        icon = params.get("icon")
+
+        if not isinstance(name, str):
+            raise TypeError(
+                "Invalid level name, it should be a string, not: '%s'" % type(name).__name__
+            )
+
+        if name not in levels:
+            if no is None:
+                raise ValueError(
+                    "Level '%s' does not exist, you have to create it by specifying a level no"
+                    % name
+                )
+            old_color, old_icon = "", " "
+        elif no is not None:
+            raise ValueError("Level '%s' already exists, you can't update its severity no" % name)
+        else:
+            _, no, old_color, old_icon = levels[name]
+
+        color = old_color if color is None else color
+        icon = old_icon if icon is None else icon
+
+        if not isinstance(no, int):
+            raise TypeError(
+                "Invalid level no, it should be an integer, not: '%s'" % type(no).__name__
+            )
+
+        if no < 0:
+            raise ValueError("Invalid level no, it should be a positive integer, not: %d" % no)
+
+        level = Level(name, no, color, icon)
+        levels = levels.copy()
+        levels[name] = level
+        levels_ansi_codes = LevelsAnsiCodes(levels_ansi_codes)
+        levels_ansi_codes[name] = Colorizer.ansify(color)
+        levels_lookup = levels_lookup.copy()
+        levels_lookup[name] = (name, name, no, icon)
+        return levels, levels_ansi_codes, levels_lookup
+
+    @staticmethod
+    def _activation_payload(activation_list, activation_none, enabled, name, status):
+        if not (name is None or isinstance(name, str)):
+            raise TypeError(
+                "Invalid name, it should be a string (or None), not: '%s'" % type(name).__name__
+            )
+
+        enabled = enabled.copy()
+
+        if name is None:
+            for existing_name in enabled:
+                if existing_name is None:
+                    enabled[existing_name] = status
+            return activation_list, status, enabled
+
+        if name != "":
+            name += "."
+
+        activation_list = [
+            (existing_name, existing_status)
+            for existing_name, existing_status in activation_list
+            if existing_name[: len(name)] != name
+        ]
+
+        parent_status = next(
+            (
+                existing_status
+                for existing_name, existing_status in activation_list
+                if name[: len(existing_name)] == existing_name
+            ),
+            None,
+        )
+        if parent_status != status and not (name == "" and status is True):
+            activation_list.append((name, status))
+
+            def modules_depth(item):
+                return item[0].count(".")
+
+            activation_list.sort(key=modules_depth, reverse=True)
+
+        for existing_name in enabled:
+            if existing_name is not None and (existing_name + ".")[: len(name)] == name:
+                enabled[existing_name] = status
+
+        return activation_list, activation_none, enabled
+
+    def reconfigure(
+        self, *, handlers=None, levels=None, extra=None, patcher=None, activation=None
+    ):
+        """Atomically replace the logger configuration.
+
+        This is equivalent to ``configure()``, except new handlers are fully prepared before the
+        configuration is changed. If a handler can't be added, the logger keeps using its previous
+        handlers, levels and ``extra`` values.
+
+        The returned list is also awaitable. Awaiting it waits for accepted records to be processed
+        by retired asynchronous and ``enqueue=True`` handlers before their sinks are closed.
+
+        Returns
+        -------
+        :class:`list` of :class:`int`
+            The identifiers of the new handlers.
+        """
+        core = self._core
+        replace_handlers = handlers is not None
+
+        with core.lock:
+            next_handlers = core.handlers
+            next_levels = core.levels
+            next_levels_ansi_codes = core.levels_ansi_codes
+            next_levels_lookup = core.levels_lookup
+            next_extra = core.extra
+            next_patcher = core.patcher
+            next_activation_list = core.activation_list
+            next_activation_none = core.activation_none
+            next_enabled = core.enabled
+
+            if levels is not None:
+                for params in levels:
+                    (
+                        next_levels,
+                        next_levels_ansi_codes,
+                        next_levels_lookup,
+                    ) = self._prepare_level(
+                        next_levels,
+                        next_levels_ansi_codes,
+                        next_levels_lookup,
+                        params,
+                    )
+
+            if extra is not None:
+                next_extra = extra.copy()
+
+            if patcher is not None:
+                next_patcher = patcher
+
+            if activation is not None:
+                for name, status in activation:
+                    (
+                        next_activation_list,
+                        next_activation_none,
+                        next_enabled,
+                    ) = self._activation_payload(
+                        next_activation_list,
+                        next_activation_none,
+                        next_enabled,
+                        name,
+                        status,
+                    )
+
+            prepared_handlers = []
+            if replace_handlers:
+                first_handler_id = core.handlers_count
+                try:
+                    for offset, params in enumerate(handlers):
+                        handler_id = first_handler_id + offset
+                        handler = self._prepare_handler(
+                            handler_id,
+                            levels=next_levels,
+                            levels_ansi_codes=next_levels_ansi_codes,
+                            **params
+                        )
+                        prepared_handlers.append((handler_id, handler))
+                except Exception as error:
+                    cleanup_errors = []
+                    for _, handler in prepared_handlers:
+                        try:
+                            handler.stop()
+                        except Exception as cleanup_error:
+                            cleanup_errors.append(cleanup_error)
+                    self._raise_errors(
+                        [error, *cleanup_errors],
+                        "Errors occurred while preparing handlers",
+                    )
+
+                core.handlers_count = first_handler_id + len(prepared_handlers)
+                next_handlers = dict(prepared_handlers)
+
+            next_min_level = min(
+                (handler.levelno for handler in next_handlers.values()),
+                default=float("inf"),
+            )
+
+            old_generation = core.generation
+            old_handlers = list(old_generation.handlers.values()) if replace_handlers else []
+            core._replace_generation(
+                handlers=next_handlers,
+                levels=next_levels,
+                levels_ansi_codes=next_levels_ansi_codes,
+                levels_lookup=next_levels_lookup,
+                extra=next_extra,
+                patcher=next_patcher,
+                min_level=next_min_level,
+                enabled=next_enabled,
+                activation_list=next_activation_list,
+                activation_none=next_activation_none,
+            )
+
+            for handler in next_handlers.values():
+                if not replace_handlers:
+                    handler.update_levels_ansi_codes(next_levels_ansi_codes)
+
+        core._wait_generation(old_generation)
+
+        tasks = []
+        complete_tasks = []
+        finish_handlers = []
+        stop_errors = []
+        for handler in old_handlers:
+            try:
+                handler_tasks, handler_complete_tasks = handler.retire()
+            except Exception as error:
+                stop_errors.append(error)
+            else:
+                tasks.extend(handler_tasks)
+                complete_tasks.extend(handler_complete_tasks)
+                if handler_tasks and not handler_complete_tasks:
+                    finish_handlers.append(handler)
+
+        async def complete_retirement():
+            for task in complete_tasks:
+                await task
+            for task in tasks:
+                await task
+            for handler in finish_handlers:
+                try:
+                    handler.finish()
+                except Exception as error:
+                    stop_errors.append(error)
+
+        awaitable = None
+        if tasks or complete_tasks or finish_handlers or stop_errors:
+
+            class Retirement:
+                def __await__(inner_self):
+                    yield from complete_retirement().__await__()
+                    Logger._raise_errors(stop_errors, "Errors occurred while retiring handlers")
+
+            awaitable = Retirement()
+
+        self._raise_errors(stop_errors, "Errors occurred while retiring handlers")
+        handler_ids = HandlerIds(
+            [handler_id for handler_id, _ in prepared_handlers], awaitable
+        )
+        return handler_ids
+
+    replace = reconfigure
 
     def configure(self, *, handlers=None, levels=None, extra=None, patcher=None, activation=None):
         """Configure the core logger.
@@ -1831,32 +2262,13 @@ class Logger:
         >>> logger.bind(context="bar").info("Suppress global context")
         >>> # => "bar - Suppress global context"
         """
-        if handlers is not None:
-            self.remove()
-        else:
-            handlers = []
-
-        if levels is not None:
-            for params in levels:
-                self.level(**params)
-
-        if patcher is not None:
-            with self._core.lock:
-                self._core.patcher = patcher
-
-        if extra is not None:
-            with self._core.lock:
-                self._core.extra.clear()
-                self._core.extra.update(extra)
-
-        if activation is not None:
-            for name, state in activation:
-                if state:
-                    self.enable(name)
-                else:
-                    self.disable(name)
-
-        return [self.add(**params) for params in handlers]
+        return self.reconfigure(
+            handlers=handlers,
+            levels=levels,
+            extra=extra,
+            patcher=patcher,
+            activation=activation,
+        )
 
     def reinstall(self):
         """Reinstall the core of logger.
@@ -1902,8 +2314,9 @@ class Logger:
                 for n in enabled:
                     if n is None:
                         enabled[n] = status
-                self._core.activation_none = status
-                self._core.enabled = enabled
+                self._core._replace_generation(
+                    enabled=enabled, activation_none=status
+                )
                 return
 
             if name != "":
@@ -1926,8 +2339,9 @@ class Logger:
                 if n is not None and (n + ".")[: len(name)] == name:
                     enabled[n] = status
 
-            self._core.activation_list = activation_list
-            self._core.enabled = enabled
+            self._core._replace_generation(
+                enabled=enabled, activation_list=activation_list
+            )
 
     @staticmethod
     def parse(file, pattern, *, cast={}, chunk=2**16):  # noqa: B006
@@ -2059,144 +2473,191 @@ class Logger:
     def _log(self, level, from_decorator, options, message, args, kwargs):
         core = self._core
 
-        if not core.handlers:
-            return
+        def finish_generation():
+            condition = generation.condition
+            with condition:
+                generation.active -= 1
+                if generation.active == 0:
+                    condition.notify_all()
 
-        try:
-            level_id, level_name, level_no, level_icon = core.levels_lookup[level]
-        except (KeyError, TypeError):
-            if isinstance(level, str):
-                raise ValueError("Level '%s' does not exist" % level) from None
-            if not isinstance(level, int):
-                raise TypeError(
-                    "Invalid level, it should be an integer or a string, not: '%s'"
-                    % type(level).__name__
-                ) from None
-            if level < 0:
-                raise ValueError(
-                    "Invalid level value, it should be a positive integer, not: %d" % level
-                ) from None
-            cache = (None, "Level %d" % level, level, " ")
-            level_id, level_name, level_no, level_icon = cache
-            core.levels_lookup[level] = cache
+        with core.lock:
+            generation = core.generation
+            generation.active += 1
+            handlers = generation.handlers
+            if not handlers:
+                finish_generation()
+                return
 
-        if level_no < core.min_level:
-            return
+            levels_lookup = generation.levels_lookup
+            try:
+                level_id, level_name, level_no, level_icon = levels_lookup[level]
+            except (KeyError, TypeError):
+                try:
+                    if isinstance(level, str):
+                        raise ValueError("Level '%s' does not exist" % level) from None
+                    if not isinstance(level, int):
+                        raise TypeError(
+                            "Invalid level, it should be an integer or a string, not: '%s'"
+                            % type(level).__name__
+                        ) from None
+                    if level < 0:
+                        raise ValueError(
+                            "Invalid level value, it should be a positive integer, not: %d" % level
+                        ) from None
+                    cache = (None, "Level %d" % level, level, " ")
+                    levels_lookup = levels_lookup.copy()
+                    levels_lookup[level] = cache
+                    if core.generation is generation:
+                        core.levels_lookup = levels_lookup
+                        generation.levels_lookup = levels_lookup
+                    level_id, level_name, level_no, level_icon = cache
+                except Exception:
+                    finish_generation()
+                    raise
+
+            if level_no < generation.min_level:
+                finish_generation()
+                return
+
+            levels_ansi_codes = generation.levels_ansi_codes
+            core_extra = generation.extra
+            patcher = generation.patcher
+            enabled = generation.enabled
+            activation_list = generation.activation_list
+            activation_none = generation.activation_none
 
         exception, depth, record, lazy, colors, raw, capture, patchers, extra = options
 
         try:
-            frame = get_frame(depth + 2)
-        except ValueError:
-            f_globals = {}
-            f_lineno = 0
-            co_name = "<unknown>"
-            co_filename = "<unknown>"
-        else:
-            f_globals = frame.f_globals
-            f_lineno = frame.f_lineno or 0  # Can be None, see python/cpython#89726.
-            co_name = frame.f_code.co_name
-            co_filename = frame.f_code.co_filename
+            try:
+                frame = get_frame(depth + 2)
+            except ValueError:
+                f_globals = {}
+                f_lineno = 0
+                co_name = "<unknown>"
+                co_filename = "<unknown>"
+            else:
+                f_globals = frame.f_globals
+                f_lineno = frame.f_lineno or 0  # Can be None, see python/cpython#89726.
+                co_name = frame.f_code.co_name
+                co_filename = frame.f_code.co_filename
 
-        try:
-            name = f_globals["__name__"]
-        except KeyError:
-            name = None
+            try:
+                name = f_globals["__name__"]
+            except KeyError:
+                name = None
 
-        try:
-            if not core.enabled[name]:
-                return
-        except KeyError:
-            enabled = core.enabled
-            if name is None:
-                status = core.activation_none
-                enabled[name] = status
-                if not status:
+            try:
+                if not enabled[name]:
                     return
-            else:
-                dotted_name = name + "."
-                for dotted_module_name, status in core.activation_list:
-                    if dotted_name[: len(dotted_module_name)] == dotted_module_name:
-                        if status:
-                            break
-                        enabled[name] = False
+            except KeyError:
+                if name is None:
+                    status = activation_none
+                    enabled = enabled.copy()
+                    enabled[name] = status
+                    with core.lock:
+                        if core.generation is generation:
+                            core.enabled = enabled
+                            generation.enabled = enabled
+                    if not status:
                         return
-                enabled[name] = True
+                else:
+                    dotted_name = name + "."
+                    for dotted_module_name, module_status in activation_list:
+                        if dotted_name[: len(dotted_module_name)] == dotted_module_name:
+                            if module_status:
+                                break
+                            return
+                    enabled = enabled.copy()
+                    enabled[name] = True
+                    with core.lock:
+                        if core.generation is generation:
+                            core.enabled = enabled
+                            generation.enabled = enabled
 
-        current_datetime = aware_now()
+            current_datetime = aware_now()
 
-        file_name = basename(co_filename)
-        thread = current_thread()
-        process = current_process()
-        elapsed = current_datetime - start_time
+            file_name = basename(co_filename)
+            thread = current_thread()
+            process = current_process()
+            elapsed = current_datetime - start_time
 
-        if exception:
-            if isinstance(exception, BaseException):
-                type_, value, traceback = (type(exception), exception, exception.__traceback__)
-            elif isinstance(exception, tuple):
-                type_, value, traceback = exception
+            if exception:
+                if isinstance(exception, BaseException):
+                    type_, value, traceback = (type(exception), exception, exception.__traceback__)
+                elif isinstance(exception, tuple):
+                    type_, value, traceback = exception
+                else:
+                    type_, value, traceback = sys.exc_info()
+                exception = RecordException(type_, value, traceback)
             else:
-                type_, value, traceback = sys.exc_info()
-            exception = RecordException(type_, value, traceback)
-        else:
-            exception = None
+                exception = None
 
-        if is_template(message):
-            message = self._template_to_string(message)
+            if is_template(message):
+                message = self._template_to_string(message)
 
-        log_record = {
-            "elapsed": elapsed,
-            "exception": exception,
-            "extra": {**core.extra, **context.get(), **extra},
-            "file": RecordFile(file_name, co_filename),
-            "function": co_name,
-            "level": RecordLevel(level_name, level_no, level_icon),
-            "line": f_lineno,
-            "message": str(message),
-            "module": splitext(file_name)[0],
-            "name": name,
-            "process": RecordProcess(process.ident, process.name),
-            "template": str(message),
-            "thread": RecordThread(thread.ident, thread.name),
-            "time": current_datetime,
-        }
+            log_record = {
+                "elapsed": elapsed,
+                "exception": exception,
+                "extra": {**core_extra, **context.get(), **extra},
+                "file": RecordFile(file_name, co_filename),
+                "function": co_name,
+                "level": RecordLevel(level_name, level_no, level_icon),
+                "line": f_lineno,
+                "message": str(message),
+                "module": splitext(file_name)[0],
+                "name": name,
+                "process": RecordProcess(process.ident, process.name),
+                "template": str(message),
+                "thread": RecordThread(thread.ident, thread.name),
+                "time": current_datetime,
+            }
 
-        if lazy:
-            args = [arg() for arg in args]
-            kwargs = {key: value() for key, value in kwargs.items()}
+            if lazy:
+                args = [arg() for arg in args]
+                kwargs = {key: value() for key, value in kwargs.items()}
 
-        if capture and kwargs:
-            log_record["extra"].update(kwargs)
+            if capture and kwargs:
+                log_record["extra"].update(kwargs)
 
-        if record:
-            if "record" in kwargs:
-                raise TypeError(
-                    "The message can't be formatted: 'record' shall not be used as a keyword "
-                    "argument while logger has been configured with '.opt(record=True)'"
+            if record:
+                if "record" in kwargs:
+                    raise TypeError(
+                        "The message can't be formatted: 'record' shall not be used as a keyword "
+                        "argument while logger has been configured with '.opt(record=True)'"
+                    )
+                kwargs.update(record=log_record)
+
+            if colors:
+                if args or kwargs:
+                    colored_message = Colorizer.prepare_message(message, args, kwargs)
+                else:
+                    colored_message = Colorizer.prepare_simple_message(str(message))
+                log_record["message"] = colored_message.stripped
+            elif args or kwargs:
+                colored_message = None
+                with try_formatting(KeyError, IndexError, AttributeError, ValueError):
+                    log_record["message"] = message.format(*args, **kwargs)
+            else:
+                colored_message = None
+
+            if patcher:
+                patcher(log_record)
+
+            for user_patcher in patchers:
+                user_patcher(log_record)
+
+            for handler in handlers.values():
+                handler.emit(
+                    log_record,
+                    level_id,
+                    from_decorator,
+                    raw,
+                    colored_message,
+                    levels_ansi_codes,
                 )
-            kwargs.update(record=log_record)
-
-        if colors:
-            if args or kwargs:
-                colored_message = Colorizer.prepare_message(message, args, kwargs)
-            else:
-                colored_message = Colorizer.prepare_simple_message(str(message))
-            log_record["message"] = colored_message.stripped
-        elif args or kwargs:
-            colored_message = None
-            with try_formatting(KeyError, IndexError, AttributeError, ValueError):
-                log_record["message"] = message.format(*args, **kwargs)
-        else:
-            colored_message = None
-
-        if core.patcher:
-            core.patcher(log_record)
-
-        for patcher in patchers:
-            patcher(log_record)
-
-        for handler in core.handlers.values():
-            handler.emit(log_record, level_id, from_decorator, raw, colored_message)
+        finally:
+            finish_generation()
 
     def trace(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'TRACE'``."""

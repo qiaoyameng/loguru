@@ -131,6 +131,7 @@ class AsyncSink:
         self._loop = loop
         self._error_interceptor = error_interceptor
         self._tasks = weakref.WeakSet()
+        self._pending_tasks = set()
 
     def write(self, message):
         """Asynchronously write a message.
@@ -149,6 +150,7 @@ class AsyncSink:
         task = loop.create_task(coroutine)
 
         def check_exception(future):
+            self._pending_tasks.discard(future)
             if future.cancelled() or future.exception() is None:
                 return
             if not self._error_interceptor.should_catch():
@@ -157,11 +159,27 @@ class AsyncSink:
 
         task.add_done_callback(check_exception)
         self._tasks.add(task)
+        self._pending_tasks.add(task)
 
     def stop(self):
         """Cancel all pending tasks."""
         for task in self._tasks:
             task.cancel()
+        self._pending_tasks.clear()
+        stop = getattr(self._function, "stop", None)
+        if stop is not None:
+            stop()
+
+    def complete_and_stop(self):
+        """Complete pending tasks and return a coroutine stopping this sink."""
+
+        async def complete():
+            tasks = list(self._pending_tasks)
+            for task in tasks:
+                await self._complete_task(task)
+            self.stop()
+
+        return complete()
 
     def tasks_to_complete(self):
         """Return list of tasks that need to be completed.
@@ -197,11 +215,13 @@ class AsyncSink:
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_tasks"] = None
+        state["_pending_tasks"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._tasks = weakref.WeakSet()
+        self._pending_tasks = set()
 
 
 class CallableSink:
