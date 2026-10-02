@@ -6,6 +6,7 @@
 .. |Logger| replace:: :class:`~Logger`
 .. |add| replace:: :meth:`~Logger.add()`
 .. |remove| replace:: :meth:`~Logger.remove()`
+.. |replace| replace:: :meth:`~Logger.replace()`
 .. |complete| replace:: :meth:`~Logger.complete()`
 .. |catch| replace:: :meth:`~Logger.catch()`
 .. |bind| replace:: :meth:`~Logger.bind()`
@@ -150,6 +151,24 @@ else:
 
 Level = namedtuple("Level", ["name", "no", "color", "icon"])  # noqa: PYI024
 
+
+class _DispatchState:
+    """An immutable snapshot of the logger dispatch configuration (one "generation").
+
+    Emitting a log record reads a single such snapshot, which guarantees that a record is
+    always dispatched entirely to one configuration generation and never split between an
+    old and a new one. The ``inflight`` counter tracks the records currently being emitted
+    using this generation, so that a replaced generation can be drained before its handlers
+    are stopped. It is incremented and decremented while holding ``Core._dispatch_idle``.
+    """
+
+    def __init__(self, handlers, extra, min_level, patcher):
+        self.handlers = handlers
+        self.extra = extra
+        self.min_level = min_level
+        self.patcher = patcher
+        self.inflight = 0
+
 start_time = aware_now()
 
 context = ContextVar("loguru_context", default={})
@@ -215,12 +234,15 @@ class Core:
         }
 
         self.handlers_count = 0
-        self.handlers = {}
 
-        self.extra = {}
-        self.patcher = None
+        # The dispatch configuration (handlers, extra, min_level and patcher) is bundled into
+        # a single snapshot object so that it can be replaced atomically and so that each
+        # emitted record is tied to exactly one configuration generation.
+        self._dispatch = _DispatchState(
+            handlers={}, extra={}, min_level=float("inf"), patcher=None
+        )
+        self._dispatch_idle = threading.Condition(create_logger_lock())
 
-        self.min_level = float("inf")
         self.enabled = {}
         self.activation_list = []
         self.activation_none = True
@@ -228,16 +250,62 @@ class Core:
         self.thread_locals = threading.local()
         self.lock = create_logger_lock()
 
+    @property
+    def handlers(self):
+        return self._dispatch.handlers
+
+    @handlers.setter
+    def handlers(self, handlers):
+        dispatch = self._dispatch
+        self._dispatch = _DispatchState(
+            handlers, dispatch.extra, dispatch.min_level, dispatch.patcher
+        )
+
+    @property
+    def extra(self):
+        return self._dispatch.extra
+
+    @extra.setter
+    def extra(self, extra):
+        dispatch = self._dispatch
+        self._dispatch = _DispatchState(
+            dispatch.handlers, extra, dispatch.min_level, dispatch.patcher
+        )
+
+    @property
+    def min_level(self):
+        return self._dispatch.min_level
+
+    @min_level.setter
+    def min_level(self, min_level):
+        dispatch = self._dispatch
+        self._dispatch = _DispatchState(
+            dispatch.handlers, dispatch.extra, min_level, dispatch.patcher
+        )
+
+    @property
+    def patcher(self):
+        return self._dispatch.patcher
+
+    @patcher.setter
+    def patcher(self, patcher):
+        dispatch = self._dispatch
+        self._dispatch = _DispatchState(
+            dispatch.handlers, dispatch.extra, dispatch.min_level, patcher
+        )
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state["thread_locals"] = None
         state["lock"] = None
+        state["_dispatch_idle"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.thread_locals = threading.local()
         self.lock = create_logger_lock()
+        self._dispatch_idle = threading.Condition(create_logger_lock())
 
 
 class Logger:
@@ -839,6 +907,55 @@ class Logger:
             handler_id = self._core.handlers_count
             self._core.handlers_count += 1
 
+        handler = self._prepare_handler(
+            handler_id,
+            sink,
+            level=level,
+            format=format,
+            filter=filter,
+            colorize=colorize,
+            serialize=serialize,
+            backtrace=backtrace,
+            diagnose=diagnose,
+            enqueue=enqueue,
+            context=context,
+            catch=catch,
+            **kwargs
+        )
+
+        with self._core.lock:
+            handlers = self._core.handlers.copy()
+            handlers[handler_id] = handler
+
+            self._core.min_level = min(self._core.min_level, handler.levelno)
+            self._core.handlers = handlers
+
+        return handler_id
+
+    def _prepare_handler(
+        self,
+        handler_id,
+        sink,
+        *,
+        level=_defaults.LOGURU_LEVEL,
+        format=_defaults.LOGURU_FORMAT,
+        filter=_defaults.LOGURU_FILTER,
+        colorize=_defaults.LOGURU_COLORIZE,
+        serialize=_defaults.LOGURU_SERIALIZE,
+        backtrace=_defaults.LOGURU_BACKTRACE,
+        diagnose=_defaults.LOGURU_DIAGNOSE,
+        enqueue=_defaults.LOGURU_ENQUEUE,
+        context=_defaults.LOGURU_CONTEXT,
+        catch=_defaults.LOGURU_CATCH,
+        **kwargs
+    ):
+        """Validate arguments and build a new handler without registering it.
+
+        The returned handler is fully initialized (this includes opening files and starting
+        the queue thread when ``enqueue=True``) but is not yet part of the logger dispatch
+        configuration. This is used by |add| and |replace|, the latter preparing several
+        handlers before switching to them atomically.
+        """
         error_interceptor = ErrorInterceptor(catch, handler_id)
 
         if colorize is None and serialize:
@@ -1061,13 +1178,7 @@ class Logger:
                 levels_ansi_codes=self._core.levels_ansi_codes,
             )
 
-            handlers = self._core.handlers.copy()
-            handlers[handler_id] = handler
-
-            self._core.min_level = min(self._core.min_level, levelno)
-            self._core.handlers = handlers
-
-        return handler_id
+        return handler
 
     def remove(self, handler_id=None):
         """Remove a previously added handler and stop sending logs to its sink.
@@ -1682,6 +1793,20 @@ class Logger:
             except KeyError:
                 raise ValueError("Level '%s' does not exist" % name) from None
 
+        name, level, ansi = self._prepare_level(name, no, color, icon)
+
+        with self._core.lock:
+            self._apply_level(name, level, ansi)
+
+        return level
+
+    def _prepare_level(self, name, no=None, color=None, icon=None):
+        """Validate level parameters and compute the level to apply, without modifying the core."""
+        if not isinstance(name, str):
+            raise TypeError(
+                "Invalid level name, it should be a string, not: '%s'" % type(name).__name__
+            )
+
         if name not in self._core.levels:
             if no is None:
                 raise ValueError(
@@ -1692,7 +1817,7 @@ class Logger:
         elif no is not None:
             raise ValueError("Level '%s' already exists, you can't update its severity no" % name)
         else:
-            _, no, old_color, old_icon = self.level(name)
+            _, no, old_color, old_icon = self._core.levels[name]
 
         if color is None:
             color = old_color
@@ -1709,16 +1834,16 @@ class Logger:
             raise ValueError("Invalid level no, it should be a positive integer, not: %d" % no)
 
         ansi = Colorizer.ansify(color)
-        level = Level(name, no, color, icon)
 
-        with self._core.lock:
-            self._core.levels[name] = level
-            self._core.levels_ansi_codes[name] = ansi
-            self._core.levels_lookup[name] = (name, name, no, icon)
-            for handler in self._core.handlers.values():
-                handler.update_format(name)
+        return name, Level(name, no, color, icon), ansi
 
-        return level
+    def _apply_level(self, name, level, ansi):
+        """Register a validated level, this must be called with the core lock acquired."""
+        self._core.levels[name] = level
+        self._core.levels_ansi_codes[name] = ansi
+        self._core.levels_lookup[name] = (name, name, level.no, level.icon)
+        for handler in self._core.handlers.values():
+            handler.update_format(name)
 
     def disable(self, name):
         """Disable logging of messages coming from ``name`` module and its children.
@@ -1857,6 +1982,192 @@ class Logger:
                     self.disable(name)
 
         return [self.add(**params) for params in handlers]
+
+    def replace(self, *, handlers=None, levels=None, extra=None, patcher=None, activation=None):
+        """Replace the logger configuration atomically.
+
+        This is similar to |configure|, but while |configure| removes the existing handlers
+        before adding the new ones one by one, this method prepares and validates the whole
+        new configuration first, and then switches to it in a single atomic step. It is
+        therefore suitable for updating the logging configuration of a running application
+        without risking a transient state in which logs would be lost or duplicated.
+
+        If preparing any of the new handlers fails (for example because a file sink cannot
+        be created), the error is propagated, the resources acquired for the other new
+        handlers are released, and the previous configuration (handlers, levels, ``extra``
+        and ``patcher``) is left entirely untouched.
+
+        The switch is atomic with regards to concurrent logging calls: each emitted record
+        is dispatched entirely to the old or entirely to the new configuration, never to a
+        mix of both. Records accepted by the previous handlers before the switch are still
+        processed by those handlers (this includes records waiting in the queue of handlers
+        added with ``enqueue=True`` and tasks scheduled by coroutine sinks). If closing a
+        previous handler fails, the error is reported with a warning and does not cause a
+        rollback to the previous configuration.
+
+        Parameters
+        ----------
+        handlers : |list| of |dict|, optional
+            A list of each handler to be added. The list should contain dicts of params
+            passed to the |add| function as keyword arguments. If not ``None``, all
+            previously added handlers are replaced by the new ones once every new handler
+            has been successfully prepared.
+        levels : |list| of |dict|, optional
+            A list of each level to be added or updated. The list should contain dicts of
+            params passed to the |level| function as keyword arguments. This will never
+            remove previously created levels.
+        extra : |dict|, optional
+            A dict containing additional parameters bound to the core logger, useful to
+            share common properties if you call |bind| in several of your files modules. If
+            not ``None``, this will replace the previously configured ``extra`` dict.
+        patcher : |callable|_, optional
+            A function that will be applied to the record dict of each logged messages
+            across all modules using the logger. It should modify the dict in-place without
+            returning anything. The function is executed prior to the one possibly added by
+            the |patch| method. If not ``None``, this will replace previously configured
+            ``patcher`` function.
+        activation : |list| of |tuple|, optional
+            A list of ``(name, state)`` tuples which denotes which loggers should be enabled
+            (if ``state`` is ``True``) or disabled (if ``state`` is ``False``). The calls to
+            |enable| and |disable| are made accordingly to the list order. This will not
+            modify previously activated loggers, so if you need a fresh start prepend your
+            list with ``("", False)`` or ``("", True)``.
+
+        Returns
+        -------
+        :class:`list` of :class:`int`
+            A list containing the identifiers of the added sinks (if any).
+
+        Raises
+        ------
+        Exception
+            If validating or preparing the new configuration fails. In this case, the
+            previous configuration is guaranteed to be left unchanged and still active.
+
+        Examples
+        --------
+        >>> logger.replace(
+        ...     handlers=[
+        ...         dict(sink=sys.stderr, format="[{time}] {message}"),
+        ...         dict(sink="file.log", enqueue=True, serialize=True),
+        ...     ],
+        ...     levels=[dict(name="NEW", no=13, icon="¤", color="")],
+        ...     extra={"common_to_all": "default"},
+        ... )
+        [1, 2]
+        """
+        # First, validate everything that can be validated without acquiring resources.
+        prepared_levels = []
+        if levels is not None:
+            for params in levels:
+                prepared_levels.append(self._prepare_level(**params))
+
+        # Then, prepare all the new handlers (this opens files and starts queue threads).
+        # If anything fails, only the handlers prepared during this call are cleaned up,
+        # the current configuration is left untouched.
+        prepared_handlers = []
+        if handlers is not None:
+            handlers = list(handlers)
+            try:
+                with self._core.lock:
+                    base_id = self._core.handlers_count
+                    self._core.handlers_count += len(handlers)
+
+                for offset, params in enumerate(handlers):
+                    handler_id = base_id + offset
+                    handler = self._prepare_handler(handler_id, **params)
+                    prepared_handlers.append((handler_id, handler))
+            except Exception:
+                for _, handler in prepared_handlers:
+                    try:
+                        handler.stop()
+                    except Exception as error:
+                        warnings.warn(
+                            "Failed to clean up handler %r while aborting "
+                            "'replace()': %s" % (handler, error)
+                        )
+                raise
+
+        # Finally, commit the new configuration as one atomic step. The previous
+        # generation is drained before being stopped, so that records currently being
+        # emitted are not lost and are never dispatched to a mix of both configurations.
+        with self._core.lock:
+            for name, level, ansi in prepared_levels:
+                self._apply_level(name, level, ansi)
+                for _, handler in prepared_handlers:
+                    handler.update_format(name)
+
+            old_dispatch = self._core._dispatch
+
+            if handlers is None:
+                new_handlers = old_dispatch.handlers
+                new_min_level = old_dispatch.min_level
+                retired_handlers = []
+            else:
+                new_handlers = dict(prepared_handlers)
+                new_min_level = min(
+                    (handler.levelno for _, handler in prepared_handlers),
+                    default=float("inf"),
+                )
+                retired_handlers = list(old_dispatch.handlers.values())
+
+            if extra is None:
+                new_extra = old_dispatch.extra
+            else:
+                new_extra = {}
+                new_extra.update(extra)
+
+            if patcher is None:
+                new_patcher = old_dispatch.patcher
+            else:
+                new_patcher = patcher
+
+            new_dispatch = _DispatchState(new_handlers, new_extra, new_min_level, new_patcher)
+
+            with self._core._dispatch_idle:
+                self._core._dispatch = new_dispatch
+                while old_dispatch.inflight > 0:
+                    self._core._dispatch_idle.wait()
+
+        if activation is not None:
+            for name, state in activation:
+                if state:
+                    self.enable(name)
+                else:
+                    self.disable(name)
+
+        # The retired handlers are no longer reachable by new records and all the records
+        # they accepted have been emitted. They are now stopped gracefully: enqueued
+        # messages are flushed and asynchronous tasks are awaited first. A failure while
+        # closing them is reported separately and never rolls the configuration back.
+        for handler in retired_handlers:
+            try:
+                handler.complete_queue()
+            except Exception as error:
+                warnings.warn(
+                    "Failed to flush the queue of handler %r while replacing "
+                    "the logger configuration: %s" % (handler, error)
+                )
+
+        for handler in retired_handlers:
+            try:
+                handler.complete_async_tasks()
+            except Exception as error:
+                warnings.warn(
+                    "Failed to complete asynchronous tasks of handler %r while replacing "
+                    "the logger configuration: %s" % (handler, error)
+                )
+
+        for handler in retired_handlers:
+            try:
+                handler.stop()
+            except Exception as error:
+                warnings.warn(
+                    "Failed to close handler %r while replacing "
+                    "the logger configuration: %s" % (handler, error)
+                )
+
+        return [handler_id for handler_id, _ in prepared_handlers]
 
     def reinstall(self):
         """Reinstall the core of logger.
@@ -2059,144 +2370,160 @@ class Logger:
     def _log(self, level, from_decorator, options, message, args, kwargs):
         core = self._core
 
-        if not core.handlers:
-            return
+        # The dispatch configuration is read once, as a whole, so that the record is tied to
+        # exactly one configuration generation even if "replace()" is called concurrently.
+        # The generation is marked as "inflight" for the duration of the emission, which
+        # allows "replace()" to wait for pending records before stopping old handlers.
+        with core._dispatch_idle:
+            dispatch = core._dispatch
+            dispatch.inflight += 1
 
         try:
-            level_id, level_name, level_no, level_icon = core.levels_lookup[level]
-        except (KeyError, TypeError):
-            if isinstance(level, str):
-                raise ValueError("Level '%s' does not exist" % level) from None
-            if not isinstance(level, int):
-                raise TypeError(
-                    "Invalid level, it should be an integer or a string, not: '%s'"
-                    % type(level).__name__
-                ) from None
-            if level < 0:
-                raise ValueError(
-                    "Invalid level value, it should be a positive integer, not: %d" % level
-                ) from None
-            cache = (None, "Level %d" % level, level, " ")
-            level_id, level_name, level_no, level_icon = cache
-            core.levels_lookup[level] = cache
+            handlers = dispatch.handlers
 
-        if level_no < core.min_level:
-            return
-
-        exception, depth, record, lazy, colors, raw, capture, patchers, extra = options
-
-        try:
-            frame = get_frame(depth + 2)
-        except ValueError:
-            f_globals = {}
-            f_lineno = 0
-            co_name = "<unknown>"
-            co_filename = "<unknown>"
-        else:
-            f_globals = frame.f_globals
-            f_lineno = frame.f_lineno or 0  # Can be None, see python/cpython#89726.
-            co_name = frame.f_code.co_name
-            co_filename = frame.f_code.co_filename
-
-        try:
-            name = f_globals["__name__"]
-        except KeyError:
-            name = None
-
-        try:
-            if not core.enabled[name]:
+            if not handlers:
                 return
-        except KeyError:
-            enabled = core.enabled
-            if name is None:
-                status = core.activation_none
-                enabled[name] = status
-                if not status:
+
+            try:
+                level_id, level_name, level_no, level_icon = core.levels_lookup[level]
+            except (KeyError, TypeError):
+                if isinstance(level, str):
+                    raise ValueError("Level '%s' does not exist" % level) from None
+                if not isinstance(level, int):
+                    raise TypeError(
+                        "Invalid level, it should be an integer or a string, not: '%s'"
+                        % type(level).__name__
+                    ) from None
+                if level < 0:
+                    raise ValueError(
+                        "Invalid level value, it should be a positive integer, not: %d" % level
+                    ) from None
+                cache = (None, "Level %d" % level, level, " ")
+                level_id, level_name, level_no, level_icon = cache
+                core.levels_lookup[level] = cache
+
+            if level_no < dispatch.min_level:
+                return
+
+            exception, depth, record, lazy, colors, raw, capture, patchers, extra = options
+
+            try:
+                frame = get_frame(depth + 2)
+            except ValueError:
+                f_globals = {}
+                f_lineno = 0
+                co_name = "<unknown>"
+                co_filename = "<unknown>"
+            else:
+                f_globals = frame.f_globals
+                f_lineno = frame.f_lineno or 0  # Can be None, see python/cpython#89726.
+                co_name = frame.f_code.co_name
+                co_filename = frame.f_code.co_filename
+
+            try:
+                name = f_globals["__name__"]
+            except KeyError:
+                name = None
+
+            try:
+                if not core.enabled[name]:
                     return
-            else:
-                dotted_name = name + "."
-                for dotted_module_name, status in core.activation_list:
-                    if dotted_name[: len(dotted_module_name)] == dotted_module_name:
-                        if status:
-                            break
-                        enabled[name] = False
+            except KeyError:
+                enabled = core.enabled
+                if name is None:
+                    status = core.activation_none
+                    enabled[name] = status
+                    if not status:
                         return
-                enabled[name] = True
+                else:
+                    dotted_name = name + "."
+                    for dotted_module_name, status in core.activation_list:
+                        if dotted_name[: len(dotted_module_name)] == dotted_module_name:
+                            if status:
+                                break
+                            enabled[name] = False
+                            return
+                    enabled[name] = True
 
-        current_datetime = aware_now()
+            current_datetime = aware_now()
 
-        file_name = basename(co_filename)
-        thread = current_thread()
-        process = current_process()
-        elapsed = current_datetime - start_time
+            file_name = basename(co_filename)
+            thread = current_thread()
+            process = current_process()
+            elapsed = current_datetime - start_time
 
-        if exception:
-            if isinstance(exception, BaseException):
-                type_, value, traceback = (type(exception), exception, exception.__traceback__)
-            elif isinstance(exception, tuple):
-                type_, value, traceback = exception
+            if exception:
+                if isinstance(exception, BaseException):
+                    type_, value, traceback = (type(exception), exception, exception.__traceback__)
+                elif isinstance(exception, tuple):
+                    type_, value, traceback = exception
+                else:
+                    type_, value, traceback = sys.exc_info()
+                exception = RecordException(type_, value, traceback)
             else:
-                type_, value, traceback = sys.exc_info()
-            exception = RecordException(type_, value, traceback)
-        else:
-            exception = None
+                exception = None
 
-        if is_template(message):
-            message = self._template_to_string(message)
+            if is_template(message):
+                message = self._template_to_string(message)
 
-        log_record = {
-            "elapsed": elapsed,
-            "exception": exception,
-            "extra": {**core.extra, **context.get(), **extra},
-            "file": RecordFile(file_name, co_filename),
-            "function": co_name,
-            "level": RecordLevel(level_name, level_no, level_icon),
-            "line": f_lineno,
-            "message": str(message),
-            "module": splitext(file_name)[0],
-            "name": name,
-            "process": RecordProcess(process.ident, process.name),
-            "template": str(message),
-            "thread": RecordThread(thread.ident, thread.name),
-            "time": current_datetime,
-        }
+            log_record = {
+                "elapsed": elapsed,
+                "exception": exception,
+                "extra": {**dispatch.extra, **context.get(), **extra},
+                "file": RecordFile(file_name, co_filename),
+                "function": co_name,
+                "level": RecordLevel(level_name, level_no, level_icon),
+                "line": f_lineno,
+                "message": str(message),
+                "module": splitext(file_name)[0],
+                "name": name,
+                "process": RecordProcess(process.ident, process.name),
+                "template": str(message),
+                "thread": RecordThread(thread.ident, thread.name),
+                "time": current_datetime,
+            }
 
-        if lazy:
-            args = [arg() for arg in args]
-            kwargs = {key: value() for key, value in kwargs.items()}
+            if lazy:
+                args = [arg() for arg in args]
+                kwargs = {key: value() for key, value in kwargs.items()}
 
-        if capture and kwargs:
-            log_record["extra"].update(kwargs)
+            if capture and kwargs:
+                log_record["extra"].update(kwargs)
 
-        if record:
-            if "record" in kwargs:
-                raise TypeError(
-                    "The message can't be formatted: 'record' shall not be used as a keyword "
-                    "argument while logger has been configured with '.opt(record=True)'"
-                )
-            kwargs.update(record=log_record)
+            if record:
+                if "record" in kwargs:
+                    raise TypeError(
+                        "The message can't be formatted: 'record' shall not be used as a keyword "
+                        "argument while logger has been configured with '.opt(record=True)'"
+                    )
+                kwargs.update(record=log_record)
 
-        if colors:
-            if args or kwargs:
-                colored_message = Colorizer.prepare_message(message, args, kwargs)
+            if colors:
+                if args or kwargs:
+                    colored_message = Colorizer.prepare_message(message, args, kwargs)
+                else:
+                    colored_message = Colorizer.prepare_simple_message(str(message))
+                log_record["message"] = colored_message.stripped
+            elif args or kwargs:
+                colored_message = None
+                with try_formatting(KeyError, IndexError, AttributeError, ValueError):
+                    log_record["message"] = message.format(*args, **kwargs)
             else:
-                colored_message = Colorizer.prepare_simple_message(str(message))
-            log_record["message"] = colored_message.stripped
-        elif args or kwargs:
-            colored_message = None
-            with try_formatting(KeyError, IndexError, AttributeError, ValueError):
-                log_record["message"] = message.format(*args, **kwargs)
-        else:
-            colored_message = None
+                colored_message = None
 
-        if core.patcher:
-            core.patcher(log_record)
+            if dispatch.patcher:
+                dispatch.patcher(log_record)
 
-        for patcher in patchers:
-            patcher(log_record)
+            for patcher in patchers:
+                patcher(log_record)
 
-        for handler in core.handlers.values():
-            handler.emit(log_record, level_id, from_decorator, raw, colored_message)
+            for handler in handlers.values():
+                handler.emit(log_record, level_id, from_decorator, raw, colored_message)
+        finally:
+            with core._dispatch_idle:
+                dispatch.inflight -= 1
+                if dispatch.inflight == 0:
+                    core._dispatch_idle.notify_all()
 
     def trace(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'TRACE'``."""

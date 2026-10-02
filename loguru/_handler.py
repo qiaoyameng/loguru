@@ -238,6 +238,23 @@ class Handler:
         with lock:
             return self._sink.tasks_to_complete()
 
+    def complete_async_tasks(self):
+        """Wait for the asynchronous tasks already scheduled by the sink to complete.
+
+        This is used when the handler is retired, so that records it accepted are fully
+        processed before it is stopped. Only tasks bound to a running event loop can be
+        awaited, others are left untouched. This is a no-op for non-asynchronous sinks.
+        """
+        if self._enqueue and self._owner_process_pid != os.getpid():
+            return
+        lock = self._queue_lock if self._enqueue else self._protected_lock()
+        with lock:
+            waiter = self._sink.async_tasks_waiter()
+        # The tasks must not be awaited while the lock is acquired, as this could lead to
+        # a deadlock (the tasks completion may require the lock to be released).
+        if waiter is not None:
+            waiter()
+
     def update_format(self, level_id):
         if not self._colorize or self._is_formatter_dynamic:
             return

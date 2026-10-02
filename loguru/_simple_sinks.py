@@ -1,6 +1,7 @@
 import inspect
 import logging
 import weakref
+from asyncio import run_coroutine_threadsafe
 
 from ._asyncio_loop import get_running_loop, get_task_loop
 
@@ -48,6 +49,16 @@ class StreamSink:
         if not self._completable:
             return []
         return [self._stream.complete()]
+
+    def async_tasks_waiter(self):
+        """Return a blocking function completing scheduled asynchronous tasks, if any.
+
+        Returns
+        -------
+        None
+            Always ``None`` as stream sinks schedule no asynchronous tasks.
+        """
+        return None
 
 
 class StandardSink:
@@ -111,6 +122,16 @@ class StandardSink:
             Empty list as standard sink has no async tasks.
         """
         return []
+
+    def async_tasks_waiter(self):
+        """Return a blocking function completing scheduled asynchronous tasks, if any.
+
+        Returns
+        -------
+        None
+            Always ``None`` as standard sinks schedule no asynchronous tasks.
+        """
+        return None
 
 
 class AsyncSink:
@@ -194,6 +215,47 @@ class AsyncSink:
         except Exception:
             pass  # Handled in "check_exception()"
 
+    def async_tasks_waiter(self):
+        """Return a blocking function completing scheduled asynchronous tasks, if any.
+
+        The returned function waits (blocking the current thread) for the tasks scheduled
+        so far to be completed. Only tasks whose event loop is currently running can be
+        awaited, others are left untouched.
+
+        Returns
+        -------
+        callable or None
+            A function to call without argument to wait for the tasks, or ``None`` if
+            there is no task to wait for.
+        """
+        tasks = [task for task in self._tasks]
+        if not tasks:
+            return None
+
+        def wait_async_tasks():
+            try:
+                current_loop = get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            futures = []
+            for task in tasks:
+                try:
+                    loop = get_task_loop(task)
+                except Exception:
+                    continue
+                if loop is None or not loop.is_running():
+                    continue
+                # Waiting synchronously for tasks of the loop running in the current
+                # thread would deadlock, those tasks are left to be completed or
+                # cancelled by the caller.
+                if loop is current_loop:
+                    continue
+                futures.append(run_coroutine_threadsafe(self._complete_task(task), loop))
+            for future in futures:
+                future.result()
+
+        return wait_async_tasks
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_tasks"] = None
@@ -239,3 +301,13 @@ class CallableSink:
             Empty list as callable sink has no tasks.
         """
         return []
+
+    def async_tasks_waiter(self):
+        """Return a blocking function completing scheduled asynchronous tasks, if any.
+
+        Returns
+        -------
+        None
+            Always ``None`` as callable sinks schedule no asynchronous tasks.
+        """
+        return None
