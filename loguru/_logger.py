@@ -121,6 +121,7 @@ from ._file_sink import FileSink
 from ._get_frame import get_frame
 from ._handler import Handler
 from ._locks_machinery import create_logger_lock
+from ._receipt import Receipt
 from ._recattrs import RecordException, RecordFile, RecordLevel, RecordProcess, RecordThread
 from ._simple_sinks import AsyncSink, CallableSink, StandardSink, StreamSink
 
@@ -263,9 +264,33 @@ class Logger:
     You should not instantiate a |Logger| by yourself, use ``from loguru import logger`` instead.
     """
 
-    def __init__(self, core, exception, depth, record, lazy, colors, raw, capture, patchers, extra):
+    def __init__(
+        self,
+        core,
+        exception,
+        depth,
+        record,
+        lazy,
+        colors,
+        raw,
+        capture,
+        patchers,
+        extra,
+        receipt=False,
+    ):
         self._core = core
-        self._options = (exception, depth, record, lazy, colors, raw, capture, patchers, extra)
+        self._options = (
+            exception,
+            depth,
+            record,
+            lazy,
+            colors,
+            raw,
+            capture,
+            patchers,
+            extra,
+            receipt,
+        )
 
     def __repr__(self):
         return "<loguru.logger handlers=%r>" % list(self._core.handlers.values())
@@ -1306,7 +1331,8 @@ class Logger:
                 if from_decorator:
                     depth += 1
 
-                catch_options = [(type_, value, traceback_), depth, True, *options]
+                *options, receipt = options
+                catch_options = [(type_, value, traceback_), depth, True, *options, receipt]
 
                 logger._core.thread_locals.already_logging_exception = True
                 try:
@@ -1397,7 +1423,8 @@ class Logger:
         raw=False,
         capture=True,
         depth=0,
-        ansi=False
+        ansi=False,
+        receipt=False
     ):
         r"""Parametrize a logging call to slightly change generated log message.
 
@@ -1433,6 +1460,13 @@ class Logger:
         ansi : |bool|, optional
             Deprecated since version 0.4.1: the ``ansi`` parameter will be removed in Loguru 1.0.0,
             it is replaced by ``colors`` which is a more appropriate name.
+        receipt : |bool|, optional
+            If ``True``, the logging call returns a receipt completed once every selected handler
+            has finished processing the record. The receipt is awaitable and also provides a
+            synchronous ``wait()`` method. It reports completion of the configured sink call; it
+            does not imply that data handed to an external system has been durably persisted.
+            Filtered handlers are reported separately, and a successful ``enqueue`` only means the
+            record was accepted by the queue; the receipt waits until the sink finishes.
 
         Returns
         -------
@@ -1484,8 +1518,20 @@ class Logger:
                 stacklevel=2,
             )
 
-        args = self._options[-2:]
-        return Logger(self._core, exception, depth, record, lazy, colors, raw, capture, *args)
+        patchers, extra, _receipt = self._options[-3:]
+        return Logger(
+            self._core,
+            exception,
+            depth,
+            record,
+            lazy,
+            colors,
+            raw,
+            capture,
+            patchers,
+            extra,
+            receipt,
+        )
 
     def bind(__self, **kwargs):  # noqa: N805
         """Bind attributes to the ``extra`` dict of each logged message record.
@@ -1520,8 +1566,9 @@ class Logger:
         >>> instance_2.call("Second instance")
         127.0.0.1 - Second instance
         """
-        *options, extra = __self._options
-        return Logger(__self._core, *options, {**extra, **kwargs})
+        receipt = __self._options[-1]
+        *options, extra = __self._options[:-1]
+        return Logger(__self._core, *options, {**extra, **kwargs}, receipt)
 
     @contextlib.contextmanager
     def contextualize(__self, **kwargs):  # noqa: N805
@@ -1614,8 +1661,8 @@ class Logger:
         ...     level, message = record["level"], record["message"]
         ...     logger.patch(lambda r: r.update(record)).log(level, message)
         """
-        *options, patchers, extra = self._options
-        return Logger(self._core, *options, [*patchers, patcher], extra)
+        patchers, extra, receipt = self._options[-3:]
+        return Logger(self._core, *self._options[:7], [*patchers, patcher], extra, receipt)
 
     def level(self, name, no=None, color=None, icon=None):
         r"""Add, update or retrieve a logging level.
@@ -2059,7 +2106,10 @@ class Logger:
     def _log(self, level, from_decorator, options, message, args, kwargs):
         core = self._core
 
-        if not core.handlers:
+        receipt_option = options[-1]
+        handlers = core.handlers if not receipt_option else core.handlers.copy()
+
+        if not handlers:
             return
 
         try:
@@ -2080,10 +2130,26 @@ class Logger:
             level_id, level_name, level_no, level_icon = cache
             core.levels_lookup[level] = cache
 
-        if level_no < core.min_level:
+        if not receipt_option and level_no < core.min_level:
             return
 
-        exception, depth, record, lazy, colors, raw, capture, patchers, extra = options
+        (
+            exception,
+            depth,
+            record,
+            lazy,
+            colors,
+            raw,
+            capture,
+            patchers,
+            extra,
+            _,
+        ) = options
+
+        if receipt_option:
+            receipt = Receipt(list(handlers))
+        else:
+            receipt = None
 
         try:
             frame = get_frame(depth + 2)
@@ -2105,6 +2171,10 @@ class Logger:
 
         try:
             if not core.enabled[name]:
+                if receipt is not None:
+                    for handler_id in handlers:
+                        receipt._record_result(handler_id, "filtered")
+                    return receipt
                 return
         except KeyError:
             enabled = core.enabled
@@ -2120,6 +2190,10 @@ class Logger:
                         if status:
                             break
                         enabled[name] = False
+                        if receipt is not None:
+                            for handler_id in handlers:
+                                receipt._record_result(handler_id, "filtered")
+                            return receipt
                         return
                 enabled[name] = True
 
@@ -2195,36 +2269,39 @@ class Logger:
         for patcher in patchers:
             patcher(log_record)
 
-        for handler in core.handlers.values():
-            handler.emit(log_record, level_id, from_decorator, raw, colored_message)
+        for handler in handlers.values():
+            handler.emit(log_record, level_id, from_decorator, raw, colored_message, receipt)
+
+        if receipt is not None:
+            return receipt
 
     def trace(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'TRACE'``."""
-        __self._log("TRACE", False, __self._options, __message, args, kwargs)
+        return __self._log("TRACE", False, __self._options, __message, args, kwargs)
 
     def debug(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'DEBUG'``."""
-        __self._log("DEBUG", False, __self._options, __message, args, kwargs)
+        return __self._log("DEBUG", False, __self._options, __message, args, kwargs)
 
     def info(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'INFO'``."""
-        __self._log("INFO", False, __self._options, __message, args, kwargs)
+        return __self._log("INFO", False, __self._options, __message, args, kwargs)
 
     def success(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'SUCCESS'``."""
-        __self._log("SUCCESS", False, __self._options, __message, args, kwargs)
+        return __self._log("SUCCESS", False, __self._options, __message, args, kwargs)
 
     def warning(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'WARNING'``."""
-        __self._log("WARNING", False, __self._options, __message, args, kwargs)
+        return __self._log("WARNING", False, __self._options, __message, args, kwargs)
 
     def error(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'ERROR'``."""
-        __self._log("ERROR", False, __self._options, __message, args, kwargs)
+        return __self._log("ERROR", False, __self._options, __message, args, kwargs)
 
     def critical(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'CRITICAL'``."""
-        __self._log("CRITICAL", False, __self._options, __message, args, kwargs)
+        return __self._log("CRITICAL", False, __self._options, __message, args, kwargs)
 
     def exception(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log an ``'ERROR'`` message while also capturing the currently handled exception.
@@ -2234,7 +2311,7 @@ class Logger:
         argument of |opt| along with a call to the |error| method (for example).
         """
         options = (True, *__self._options[1:])
-        __self._log("ERROR", False, options, __message, args, kwargs)
+        return __self._log("ERROR", False, options, __message, args, kwargs)
 
     def log(__self, __level, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``level``.
@@ -2242,7 +2319,7 @@ class Logger:
         Note that if an |int| is provided as ``level``, the level is interpreted as an anonymous
         one and displayed as such (see also |FAQ anonymous levels| for more details).
         """
-        __self._log(__level, False, __self._options, __message, args, kwargs)
+        return __self._log(__level, False, __self._options, __message, args, kwargs)
 
     def start(self, *args, **kwargs):
         """Add a handler sending log messages to a sink adequately configured.

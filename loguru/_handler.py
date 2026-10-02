@@ -2,12 +2,14 @@ import functools
 import json
 import multiprocessing
 import os
+import sys
 import threading
 from contextlib import contextmanager
 from threading import Thread
 
 from ._colorizer import Colorizer
 from ._locks_machinery import create_handler_lock
+from ._receipt import Acknowledgment
 
 
 def prepare_colored_format(format_, ansi_level):
@@ -26,6 +28,30 @@ def memoize(function):
 
 class Message(str):
     __slots__ = ("record",)
+
+
+class QueuedMessage(str):
+    __slots__ = ("record", "acknowledgment_token")
+
+    def __new__(cls, message, acknowledgment=None):
+        obj = str.__new__(cls, message)
+        obj.record = getattr(message, "record", None)
+        obj.acknowledgment_token = None
+        if acknowledgment is not None:
+            obj.acknowledgment_token = acknowledgment.local_token
+        return obj
+
+    def __getstate__(self):
+        return {
+            "text": str(self),
+            "record": self.record,
+            "acknowledgment_token": self.acknowledgment_token,
+        }
+
+    def __setstate__(self, state):
+        str.__init__(self)
+        self.record = state["record"]
+        self.acknowledgment_token = state["acknowledgment_token"]
 
 
 class Handler:
@@ -71,6 +97,8 @@ class Handler:
         self._lock_acquired = threading.local()
         self._queue = None
         self._queue_lock = None
+        self._acknowledgments = {}
+        self._receipt_queue = None
         self._confirmation_event = None
         self._confirmation_lock = None
         self._owner_process_pid = None
@@ -91,10 +119,12 @@ class Handler:
         if self._enqueue:
             if self._multiprocessing_context is None:
                 self._queue = multiprocessing.SimpleQueue()
+                self._receipt_queue = multiprocessing.Queue()
                 self._confirmation_event = multiprocessing.Event()
                 self._confirmation_lock = multiprocessing.Lock()
             else:
                 self._queue = self._multiprocessing_context.SimpleQueue()
+                self._receipt_queue = self._multiprocessing_context.Queue()
                 self._confirmation_event = self._multiprocessing_context.Event()
                 self._confirmation_lock = self._multiprocessing_context.Lock()
             self._queue_lock = create_handler_lock()
@@ -124,13 +154,27 @@ class Handler:
         finally:
             self._lock_acquired.acquired = False
 
-    def emit(self, record, level_id, from_decorator, is_raw, colored_message):
+    def emit(self, record, level_id, from_decorator, is_raw, colored_message, receipt=None):
+        acknowledgment = None
+        if receipt is not None:
+            local = not self._enqueue or self._owner_process_pid == os.getpid()
+            if local:
+                acknowledgment = receipt.create_acknowledgment(self._id)
+            else:
+                acknowledgment = receipt.create_process_acknowledgment(
+                    self._id, self._receipt_queue
+                )
+
         try:
             if self._levelno > record["level"].no:
+                if acknowledgment is not None:
+                    acknowledgment.filtered()
                 return
 
             if self._filter is not None:
                 if not self._filter(record):
+                    if acknowledgment is not None:
+                        acknowledgment.filtered()
                     return
 
             if self._is_formatter_dynamic:
@@ -199,15 +243,34 @@ class Handler:
 
             with self._protected_lock():
                 if self._stopped:
+                    if acknowledgment is not None:
+                        acknowledgment.skipped()
                     return
                 if self._enqueue:
-                    self._queue.put(str_record)
+                    if acknowledgment is not None:
+                        token = acknowledgment.local_token
+                        self._acknowledgments[token] = acknowledgment
+                    if acknowledgment is None:
+                        self._queue.put(str_record)
+                    else:
+                        try:
+                            self._queue.put(QueuedMessage(str_record, acknowledgment))
+                        except Exception:
+                            self._acknowledgments.pop(acknowledgment.local_token, None)
+                            raise
                 else:
-                    self._sink.write(str_record)
+                    self._sink.write(str_record, acknowledgment)
+                    if acknowledgment is not None and not getattr(
+                        self._sink, "asynchronous", False
+                    ):
+                        acknowledgment.succeed()
         except Exception:
-            if not self._error_interceptor.should_catch():
-                raise
-            self._error_interceptor.print(record)
+            if acknowledgment is not None:
+                acknowledgment.fail(sys.exc_info()[1])
+            else:
+                if not self._error_interceptor.should_catch():
+                    raise
+                self._error_interceptor.print(record)
 
     def stop(self):
         with self._protected_lock():
@@ -219,6 +282,8 @@ class Handler:
                 self._thread.join()
                 if hasattr(self._queue, "close"):
                     self._queue.close()
+                if hasattr(self._receipt_queue, "close"):
+                    self._receipt_queue.close()
 
             self._sink.stop()
 
@@ -328,11 +393,30 @@ class Handler:
                 self._confirmation_event.set()
                 continue
 
+            acknowledgment = None
+            if isinstance(message, QueuedMessage):
+                token = message.acknowledgment_token
+                acknowledgment = self._acknowledgments.pop(token, None)
+                if acknowledgment is None and isinstance(token, int):
+                    acknowledgment = Acknowledgment(token, self._id, self._receipt_queue)
+
             with lock:
                 try:
-                    self._sink.write(message)
+                    self._sink.write(message, acknowledgment)
                 except Exception:
-                    self._error_interceptor.print(message.record)
+                    if acknowledgment is not None:
+                        self._acknowledgments.pop(acknowledgment.local_token, None)
+                        acknowledgment.fail(sys.exc_info()[1])
+                    if acknowledgment is None:
+                        self._error_interceptor.print(message.record)
+                else:
+                    if acknowledgment is not None:
+                        self._acknowledgments.pop(acknowledgment.local_token, None)
+                        if not (
+                            acknowledgment._callback is not None
+                            and getattr(self._sink, "asynchronous", False)
+                        ):
+                            acknowledgment.succeed()
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -343,6 +427,8 @@ class Handler:
             state["_sink"] = None
             state["_thread"] = None
             state["_queue_lock"] = None
+            state["_acknowledgments"] = None
+            state["_receipt_queue"] = None
         return state
 
     def __setstate__(self, state):
@@ -351,6 +437,8 @@ class Handler:
         self._lock_acquired = threading.local()
         if self._enqueue:
             self._queue_lock = create_handler_lock()
+            self._acknowledgments = {}
+            self._receipt_queue = None
         if self._is_formatter_dynamic:
             if self._colorize:
                 self._memoize_dynamic_format = memoize(prepare_colored_format)

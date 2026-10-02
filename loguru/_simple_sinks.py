@@ -20,14 +20,8 @@ class StreamSink:
         self._stoppable = callable(getattr(stream, "stop", None))
         self._completable = inspect.iscoroutinefunction(getattr(stream, "complete", None))
 
-    def write(self, message):
-        """Write a message to the stream.
-
-        Parameters
-        ----------
-        message
-            The message to write.
-        """
+    def write(self, message, acknowledgment=None):
+        """Write a message to the stream."""
         self._stream.write(message)
         if self._flushable:
             self._stream.flush()
@@ -62,14 +56,8 @@ class StandardSink:
     def __init__(self, handler):
         self._handler = handler
 
-    def write(self, message):
-        """Write a message using the standard logging handler.
-
-        Parameters
-        ----------
-        message
-            The message to write.
-        """
+    def write(self, message, acknowledgment=None):
+        """Write a message using the standard logging handler."""
         if message.record["level"].no < self._handler.level:
             return
         raw_record = message.record
@@ -126,37 +114,51 @@ class AsyncSink:
         An interceptor for handling errors.
     """
 
+    asynchronous = True
+
     def __init__(self, function, loop, error_interceptor):
         self._function = function
         self._loop = loop
         self._error_interceptor = error_interceptor
         self._tasks = weakref.WeakSet()
 
-    def write(self, message):
-        """Asynchronously write a message.
-
-        Parameters
-        ----------
-        message
-            The message to write.
-        """
+    def write(self, message, acknowledgment=None):
+        """Asynchronously write a message."""
         try:
             loop = self._loop or get_running_loop()
         except RuntimeError:
+            if acknowledgment is not None:
+                acknowledgment.fail(RuntimeError("No running event loop to execute coroutine sink"))
             return
 
         coroutine = self._function(message)
         task = loop.create_task(coroutine)
 
-        def check_exception(future):
-            if future.cancelled() or future.exception() is None:
-                return
-            if not self._error_interceptor.should_catch():
-                raise future.exception()
-            self._error_interceptor.print(message.record, exception=future.exception())
+        if acknowledgment is not None:
+            def acknowledge(future):
+                if future.cancelled():
+                    acknowledgment.fail(RuntimeError("Coroutine sink task was cancelled"))
+                else:
+                    exception = future.exception()
+                    if exception is None:
+                        acknowledgment.succeed()
+                    else:
+                        acknowledgment.fail(exception)
 
-        task.add_done_callback(check_exception)
+            task.add_done_callback(acknowledge)
+        else:
+            def check_exception(future):
+                if future.cancelled() or future.exception() is None:
+                    return
+                if not self._error_interceptor.should_catch():
+                    raise future.exception()
+                self._error_interceptor.print(
+                    message.record, exception=future.exception()
+                )
+
+            task.add_done_callback(check_exception)
         self._tasks.add(task)
+        return task
 
     def stop(self):
         """Cancel all pending tasks."""
@@ -216,14 +218,8 @@ class CallableSink:
     def __init__(self, function):
         self._function = function
 
-    def write(self, message):
-        """Write a message by calling the function.
-
-        Parameters
-        ----------
-        message
-            The message to pass to the function.
-        """
+    def write(self, message, acknowledgment=None):
+        """Write a message by calling the function."""
         self._function(message)
 
     def stop(self):

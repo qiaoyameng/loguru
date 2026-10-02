@@ -202,7 +202,7 @@ class FileSink:
             self._create_dirs(path)
             self._create_file(path)
 
-    def write(self, message):
+    def write(self, message, acknowledgment=None):
         if self._file is None:
             path = self._create_path()
             self._create_dirs(path)

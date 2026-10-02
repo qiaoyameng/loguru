@@ -11,6 +11,7 @@ from typing import (
     Dict,
     Generator,
     Generic,
+    Iterator,
     List,
     NamedTuple,
     NewType,
@@ -68,6 +69,39 @@ class _GeneratorContextManager(ContextManager[_T], Generic[_T]):
 Catcher = NewType("Catcher", _GeneratorContextManager[None])
 Contextualizer = NewType("Contextualizer", _GeneratorContextManager[None])
 AwaitableCompleter = Awaitable[None]
+LogReturn = Optional["Receipt"]
+
+class HandlerReceipt(NamedTuple):
+    handler_id: int
+    status: str
+    error: Optional[BaseException]
+
+class ReceiptResult:
+    @property
+    def results(self) -> Tuple[HandlerReceipt, ...]: ...
+    @property
+    def selected(self) -> Tuple[HandlerReceipt, ...]: ...
+    @property
+    def succeeded(self) -> Tuple[HandlerReceipt, ...]: ...
+    @property
+    def failed(self) -> Tuple[HandlerReceipt, ...]: ...
+    @property
+    def filtered(self) -> Tuple[HandlerReceipt, ...]: ...
+    @property
+    def skipped(self) -> Tuple[HandlerReceipt, ...]: ...
+    @property
+    def ok(self) -> bool: ...
+    def __iter__(self) -> Iterator[HandlerReceipt]: ...
+    def __len__(self) -> int: ...
+    def __getitem__(self, handler_id: int) -> HandlerReceipt: ...
+
+class Receipt:
+    @property
+    def result(self) -> Optional[ReceiptResult]: ...
+    def wait(self, timeout: Optional[float] = ...) -> ReceiptResult: ...
+    def __await__(self) -> Any: ...
+
+AwaitableReceipt = Awaitable[ReceiptResult]
 
 class Level(NamedTuple):
     name: str
@@ -298,7 +332,8 @@ class Logger:
         raw: bool = ...,
         capture: bool = ...,
         depth: int = ...,
-        ansi: bool = ...
+        ansi: bool = ...,
+        receipt: bool = ...
     ) -> Logger: ...
     def bind(__self, **kwargs: Any) -> Logger: ...  # noqa: N805
     def contextualize(__self, **kwargs: Any) -> Contextualizer: ...  # noqa: N805
@@ -352,39 +387,53 @@ class Logger:
         chunk: int = ...
     ) -> Generator[Dict[str, Any], None, None]: ...
     @overload
-    def trace(__self, __message: LoggedStr, *args: Any, **kwargs: Any) -> None: ...  # noqa: N805
+    def trace(
+        __self, __message: LoggedStr, *args: Any, **kwargs: Any
+    ) -> LogReturn: ...  # noqa: N805
     @overload
-    def trace(__self, __message: Any) -> None: ...  # noqa: N805
+    def trace(__self, __message: Any) -> LogReturn: ...  # noqa: N805
     @overload
-    def debug(__self, __message: LoggedStr, *args: Any, **kwargs: Any) -> None: ...  # noqa: N805
+    def debug(
+        __self, __message: LoggedStr, *args: Any, **kwargs: Any
+    ) -> LogReturn: ...  # noqa: N805
     @overload
-    def debug(__self, __message: Any) -> None: ...  # noqa: N805
+    def debug(__self, __message: Any) -> LogReturn: ...  # noqa: N805
     @overload
-    def info(__self, __message: LoggedStr, *args: Any, **kwargs: Any) -> None: ...  # noqa: N805
+    def info(
+        __self, __message: LoggedStr, *args: Any, **kwargs: Any
+    ) -> LogReturn: ...  # noqa: N805
     @overload
-    def info(__self, __message: Any) -> None: ...  # noqa: N805
+    def info(__self, __message: Any) -> LogReturn: ...  # noqa: N805
     @overload
-    def success(__self, __message: LoggedStr, *args: Any, **kwargs: Any) -> None: ...  # noqa: N805
+    def success(
+        __self, __message: LoggedStr, *args: Any, **kwargs: Any
+    ) -> LogReturn: ...  # noqa: N805
     @overload
-    def success(__self, __message: Any) -> None: ...  # noqa: N805
+    def success(__self, __message: Any) -> LogReturn: ...  # noqa: N805
     @overload
-    def warning(__self, __message: LoggedStr, *args: Any, **kwargs: Any) -> None: ...  # noqa: N805
+    def warning(
+        __self, __message: LoggedStr, *args: Any, **kwargs: Any
+    ) -> LogReturn: ...  # noqa: N805
     @overload
-    def warning(__self, __message: Any) -> None: ...  # noqa: N805
+    def warning(__self, __message: Any) -> LogReturn: ...  # noqa: N805
     @overload
-    def error(__self, __message: LoggedStr, *args: Any, **kwargs: Any) -> None: ...  # noqa: N805
+    def error(
+        __self, __message: LoggedStr, *args: Any, **kwargs: Any
+    ) -> LogReturn: ...  # noqa: N805
     @overload
-    def error(__self, __message: Any) -> None: ...  # noqa: N805
+    def error(__self, __message: Any) -> LogReturn: ...  # noqa: N805
     @overload
-    def critical(__self, __message: LoggedStr, *args: Any, **kwargs: Any) -> None: ...  # noqa: N805
+    def critical(
+        __self, __message: LoggedStr, *args: Any, **kwargs: Any
+    ) -> LogReturn: ...  # noqa: N805
     @overload
-    def critical(__self, __message: Any) -> None: ...  # noqa: N805
+    def critical(__self, __message: Any) -> LogReturn: ...  # noqa: N805
     @overload
     def exception(
         __self, __message: LoggedStr, *args: Any, **kwargs: Any  # noqa: N805
-    ) -> None: ...
+    ) -> LogReturn: ...
     @overload
-    def exception(__self, __message: Any) -> None: ...  # noqa: N805
+    def exception(__self, __message: Any) -> LogReturn: ...  # noqa: N805
     @overload
     def log(
         __self,  # noqa: N805
@@ -392,9 +441,9 @@ class Logger:
         __message: LoggedStr,
         *args: Any,
         **kwargs: Any
-    ) -> None: ...
+    ) -> LogReturn: ...
     @overload
-    def log(__self, __level: Union[int, str], __message: Any) -> None: ...  # noqa: N805
+    def log(__self, __level: Union[int, str], __message: Any) -> LogReturn: ...  # noqa: N805
     def start(self, *args: Any, **kwargs: Any) -> int: ...
     def stop(self, *args: Any, **kwargs: Any) -> None: ...
 
