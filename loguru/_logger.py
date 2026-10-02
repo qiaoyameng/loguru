@@ -650,8 +650,10 @@ class Logger:
         file with the same name that the file to be created, then the existing file is renamed by
         appending the date to its basename to prevent file overwriting. This parameter accepts:
 
-        - an |int| which corresponds to the maximum file size in bytes before that the current
-          logged file is closed and a new one started over.
+        - an |int| which corresponds to the maximum file size in bytes. The check is made using
+          the encoded bytes of the complete next record, including line endings and any byte order
+          mark. If a record is larger than the remaining space, it is written entirely to a new
+          file. A record larger than the whole limit is still written once without being split.
         - a |timedelta| which indicates the frequency of each new rotation.
         - a |time| which specifies the hour when the daily rotation should occur.
         - a |str| for human-friendly parametrization of one of the previously enumerated types.

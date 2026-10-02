@@ -1,5 +1,6 @@
 import datetime
 import time
+from unittest.mock import Mock
 
 from loguru import logger
 
@@ -59,7 +60,12 @@ def test_retention_early_remove(tmp_path):
 
 def test_rotation(tmp_path, freeze_time):
     with freeze_time("2001-02-03"):
-        i = logger.add(tmp_path / "file.log", rotation=0, delay=True, format="{message}")
+        i = logger.add(
+            tmp_path / "file.log",
+            rotation=Mock(return_value=True),
+            delay=True,
+            format="{message}",
+        )
         logger.debug("a")
         logger.remove(i)
 

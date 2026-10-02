@@ -1,3 +1,5 @@
+import codecs
+import copy
 import datetime
 import decimal
 import glob
@@ -5,6 +7,7 @@ import numbers
 import os
 import shutil
 import string
+import sys
 from functools import partial
 from stat import ST_DEV, ST_INO
 
@@ -84,6 +87,104 @@ class Retention:
                 os.remove(log)
 
 
+class ByteSizeRotation:
+    def __init__(self, size_limit, encoding, errors=None, newline=None):
+        self.size_limit = size_limit
+        self.encoding = encoding
+        self.errors = errors
+        self.newline = newline
+
+        self._codec_info = None
+        self._file = None
+        self._encoder = None
+        self._candidate_encoder = None
+        self._file_has_bom = False
+
+    def __call__(self, message, file):
+        if self._codec_info is None:
+            self._codec_info = codecs.lookup(self.encoding)
+
+        if self._file is not file:
+            self._bind_file(file)
+
+        self._candidate_encoder = copy.copy(self._encoder)
+        bom = self._candidate_encoder.encode("")
+        if self._file_has_bom:
+            bom = b""
+        data = self._candidate_encoder.encode(self._transform_newlines(message))
+        candidate_size = len(bom) + len(data)
+
+        file.seek(0, 2)
+        current_size = file.tell()
+
+        if current_size == 0 or current_size + candidate_size <= self.size_limit:
+            return False
+
+        return True
+
+    def commit(self):
+        if self._candidate_encoder is None:
+            return
+
+        payload_encoding = self._payload_encoding()
+        if payload_encoding is not None:
+            encoder = codecs.lookup(payload_encoding).incrementalencoder(self.errors)
+            encoder.encode(self._candidate_encoder.buffer)
+            self._encoder = encoder
+            self._file_has_bom = True
+        else:
+            self._encoder = self._candidate_encoder
+
+        self._candidate_encoder = None
+
+    def _payload_encoding(self):
+        codec_name = self._codec_info.name
+        if codec_name == "utf-16":
+            return "utf-16-le" if sys.byteorder == "little" else "utf-16-be"
+        if codec_name == "utf-32":
+            return "utf-32-le" if sys.byteorder == "little" else "utf-32-be"
+        if codec_name == "utf-8-sig":
+            return "utf-8"
+        return None
+
+    def reset(self):
+        if self._codec_info is None:
+            self._codec_info = codecs.lookup(self.encoding)
+
+        encoder = self._codec_info.incrementalencoder(self.errors)
+        self._file = None
+        self._encoder = encoder
+        self._candidate_encoder = None
+        self._file_has_bom = False
+
+    def _bind_file(self, file):
+        file.seek(0, 2)
+        current_size = file.tell()
+
+        if self._codec_info is None:
+            self._codec_info = codecs.lookup(self.encoding)
+
+        encoder = self._codec_info.incrementalencoder(self.errors)
+
+        if current_size:
+            encoder.encode("")
+            self._file_has_bom = True
+        else:
+            self._file_has_bom = False
+
+        self._file = file
+        self._encoder = encoder
+
+    def _transform_newlines(self, message):
+        if self.newline == "\r":
+            return message.replace("\n", "\r")
+        if self.newline == "\r\n":
+            return message.replace("\r\n", "\n").replace("\n", "\r\n")
+        if self.newline is None:
+            return message.replace("\r\n", "\n").replace("\n", os.linesep)
+        return message
+
+
 class Rotation:
     @staticmethod
     def forward_day(t):
@@ -98,10 +199,24 @@ class Rotation:
     def forward_interval(t, interval):
         return t + interval
 
-    @staticmethod
-    def rotation_size(message, file, size_limit):
-        file.seek(0, 2)
-        return file.tell() + len(message) > size_limit
+    class RotationGroup:
+        def __init__(self, rotations) -> None:
+            self._rotations = rotations
+
+        def __call__(self, message, file) -> bool:
+            return any(rotation(message, file) for rotation in self._rotations)
+
+        def commit(self) -> None:
+            for rotation in self._rotations:
+                commit = getattr(rotation, "commit", None)
+                if commit is not None:
+                    commit()
+
+        def reset(self) -> None:
+            for rotation in self._rotations:
+                reset = getattr(rotation, "reset", None)
+                if reset is not None:
+                    reset()
 
     class RotationTime:
         def __init__(self, step_forward, time_target=None, day_target=None):
@@ -157,13 +272,6 @@ class Rotation:
                 return True
             return False
 
-    class RotationGroup:
-        def __init__(self, rotations) -> None:
-            self._rotations = rotations
-
-        def __call__(self, message, file) -> bool:
-            return any(rotation(message, file) for rotation in self._rotations)
-
 
 class FileSink:
     def __init__(
@@ -186,7 +294,9 @@ class FileSink:
         self._path = str(path)
 
         self._glob_patterns = self._make_glob_patterns(self._path)
-        self._rotation_function = self._make_rotation_function(rotation)
+        self._rotation_function = self._make_rotation_function(
+            rotation, self.encoding, self._kwargs.get("errors"), self._kwargs.get("newline")
+        )
         self._retention_function = self._make_retention_function(retention)
         self._compression_function = self._make_compression_function(compression)
 
@@ -211,10 +321,23 @@ class FileSink:
         if self._watch:
             self._reopen_if_needed()
 
-        if self._rotation_function is not None and self._rotation_function(message, self._file):
+        should_rotate = (
+            self._rotation_function is not None
+            and self._rotation_function(message, self._file)
+        )
+
+        if should_rotate:
             self._terminate_file(is_rotating=True)
+            reset = getattr(self._rotation_function, "reset", None)
+            if reset is not None:
+                reset()
 
         self._file.write(message)
+
+        if self._rotation_function is not None:
+            commit = getattr(self._rotation_function, "commit", None)
+            if commit is not None:
+                commit()
 
     def stop(self):
         if self._watch:
@@ -318,19 +441,22 @@ class FileSink:
         return [escaped, escaped + ".*", root + ".*" + ext, root + ".*" + ext + ".*"]
 
     @staticmethod
-    def _make_rotation_function(rotation):
+    def _make_rotation_function(rotation, encoding=None, errors=None, newline=None):
         if rotation is None:
             return None
         if isinstance(rotation, (list, tuple, set)):
             if len(rotation) == 0:
                 raise ValueError("Must provide at least one rotation condition")
             return Rotation.RotationGroup(
-                [FileSink._make_rotation_function(rot) for rot in rotation]
+                [
+                    FileSink._make_rotation_function(rot, encoding, errors, newline)
+                    for rot in rotation
+                ]
             )
         if isinstance(rotation, str):
             size = string_parsers.parse_size(rotation)
             if size is not None:
-                return FileSink._make_rotation_function(size)
+                return FileSink._make_rotation_function(size, encoding, errors, newline)
             interval = string_parsers.parse_duration(rotation)
             if interval is not None:
                 return FileSink._make_rotation_function(interval)
@@ -348,7 +474,7 @@ class FileSink:
                 return Rotation.RotationTime(step_forward, time, day)
             raise ValueError("Cannot parse rotation from: '%s'" % rotation)
         if isinstance(rotation, (numbers.Real, decimal.Decimal)):
-            return partial(Rotation.rotation_size, size_limit=rotation)
+            return ByteSizeRotation(rotation, encoding, errors, newline)
         if isinstance(rotation, datetime.time):
             return Rotation.RotationTime(Rotation.forward_day, rotation)
         if isinstance(rotation, datetime.timedelta):

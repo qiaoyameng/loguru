@@ -25,7 +25,7 @@ def tmp_path_local(reset_logger):
 
 def test_renaming(freeze_time, tmp_path):
     with freeze_time("2020-01-01") as frozen:
-        logger.add(tmp_path / "file.log", rotation=0, format="{message}")
+        logger.add(tmp_path / "file.log", rotation=Mock(return_value=True), format="{message}")
 
         frozen.tick()
         logger.debug("a")
@@ -53,7 +53,9 @@ def test_renaming(freeze_time, tmp_path):
 
 def test_no_renaming(freeze_time, tmp_path):
     with freeze_time("2018-01-01 00:00:00") as frozen:
-        logger.add(tmp_path / "file_{time}.log", rotation=0, format="{message}")
+        logger.add(
+            tmp_path / "file_{time}.log", rotation=Mock(return_value=True), format="{message}"
+        )
 
         frozen.move_to("2019-01-01 00:00:00")
         logger.debug("a")
@@ -102,6 +104,149 @@ def test_size_rotation(freeze_time, tmp_path, size):
             ("test_2018-01-01_00-00-03_000000.log", "klmno\n"),
         ],
     )
+
+
+@pytest.mark.parametrize(
+    ("limit", "messages", "expected"),
+    [
+        (4, ["中", "a"], [(b"\xe4\xb8\xad\n", "中\n"), (b"a\n", "a\n")]),
+        (4, ["ab", "c"], [(b"ab\n", "ab\n"), (b"c\n", "c\n")]),
+        (5, ["ab", "c"], [(b"ab\nc\n", "ab\nc\n")]),
+        (5, ["a\nb", "c"], [(b"a\rb\r", "a\nb\r"), (b"c\r", "c\r")]),
+    ],
+)
+def test_size_rotation_uses_actual_encoded_bytes(tmp_path, limit, messages, expected):
+    logger.add(
+        tmp_path / "file_{time}.log",
+        format="{message}",
+        rotation=limit,
+        encoding="utf-8",
+        newline="\r" if messages and "\n" in messages[0] else None,
+        catch=False,
+    )
+
+    for message in messages:
+        logger.info(message)
+
+    files = sorted(tmp_path.glob("file_*.log"))
+
+    assert [(path.stat().st_size, path.read_bytes()) for path in files] == [
+        (len(data), data) for data, _ in expected
+    ]
+
+
+def test_size_rotation_counts_utf16_bom(freeze_time, tmp_path):
+    with freeze_time("2020-01-01") as frozen:
+        logger.add(
+            tmp_path / "file.log",
+            format="{message}",
+            rotation=7,
+            encoding="utf-16",
+            newline="",
+            catch=False,
+            delay=True,
+        )
+
+        frozen.tick()
+        logger.info("a")
+        frozen.tick()
+        logger.info("中")
+        frozen.tick()
+        logger.info("b")
+
+    files = sorted(tmp_path.glob("file*.log"))
+
+    assert [(path.stat().st_size, path.read_bytes()) for path in files] == [
+        (6, b"\xff\xfea\x00\n\x00"),
+        (6, b"\xff\xfe-N\n\x00"),
+        (6, b"\xff\xfeb\x00\n\x00"),
+    ]
+
+
+def test_size_rotation_includes_existing_appended_file(tmp_path):
+    file = tmp_path / "file.log"
+    file.write_bytes(b"xx")
+
+    i = logger.add(file, format="{message}", rotation=4, catch=False)
+    logger.info("中")
+    logger.info("a")
+    logger.remove(i)
+
+    files = sorted(tmp_path.iterdir())
+
+    assert [(path.stat().st_size, path.read_bytes()) for path in files] == [
+        (2, b"xx"),
+        (4, b"\xe4\xb8\xad\n"),
+        (2, b"a\n"),
+    ]
+
+
+def test_oversized_record_does_not_split_or_rotate_empty_files(tmp_path):
+    logger.add(
+        tmp_path / "file_{time}.log",
+        format="{message}",
+        rotation=0,
+        catch=False,
+    )
+
+    logger.info("a")
+    logger.info("bb")
+
+    files = sorted(tmp_path.glob("file_*.log"))
+
+    assert [(path.stat().st_size, path.read_bytes()) for path in files] == [
+        (2, b"a\n"),
+        (3, b"bb\n"),
+    ]
+
+
+def test_size_rotation_compression_preserves_complete_record(freeze_time, tmp_path):
+    import gzip
+
+    with freeze_time("2020-01-01"):
+        i = logger.add(
+            tmp_path / "file.log",
+            format="{message}",
+            rotation=4,
+            compression="gz",
+            catch=False,
+        )
+        logger.info("old")
+        logger.info("new")
+        logger.remove(i)
+
+    compressed = tmp_path / "file.2020-01-01_00-00-00_000000.log.gz"
+
+    assert compressed.exists()
+    assert gzip.decompress(compressed.read_bytes()) == b"old\n"
+    assert (tmp_path / "file.log").read_bytes() == b"new\n"
+
+
+def test_size_rotation_encoding_error_keeps_existing_file(tmp_path):
+    file = tmp_path / "file.log"
+
+    i = logger.add(
+        file,
+        format="{message}",
+        rotation=4,
+        encoding="ascii",
+        errors="strict",
+        catch=False,
+    )
+    logger.info("abc")
+
+    with pytest.raises(UnicodeEncodeError):
+        logger.info("天")
+
+    logger.info("d")
+    logger.remove(i)
+
+    files = sorted(tmp_path.iterdir())
+
+    assert [(path.stat().st_size, path.read_bytes()) for path in files] == [
+        (4, b"abc\n"),
+        (2, b"d\n"),
+    ]
 
 
 @pytest.mark.parametrize(

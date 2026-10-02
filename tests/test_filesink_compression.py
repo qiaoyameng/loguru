@@ -35,8 +35,9 @@ def test_compression_function(tmp_path):
 def test_compression_at_rotation(tmp_path, mode, freeze_time):
     with freeze_time("2010-10-09 11:30:59"):
         logger.add(
-            tmp_path / "file.log", format="{message}", rotation=0, compression="gz", mode=mode
+            tmp_path / "file.log", format="{message}", rotation=4, compression="gz", mode=mode
         )
+        logger.debug("Before")
         logger.debug("After compression")
 
     check_dir(
@@ -185,20 +186,21 @@ def test_exception_during_compression_at_rotation(freeze_time, tmp_path, capsys,
             tmp_path / "test.log",
             format="{message}",
             compression=Mock(side_effect=[Exception("Compression error"), None]),
-            rotation=0,
+            rotation=8,
             catch=True,
             delay=delay,
         )
         logger.debug("AAA")
-        frozen.tick()
         logger.debug("BBB")
+        frozen.tick()
+        logger.debug("CCC")
+        logger.debug("DDD")
 
     check_dir(
         tmp_path,
         files=[
-            ("test.2017-07-01_00-00-00_000000.log", ""),
-            ("test.2017-07-01_00-00-01_000000.log", ""),
-            ("test.log", "BBB\n"),
+            ("test.2017-07-01_00-00-00_000000.log", "AAA\nBBB\n"),
+            ("test.log", "DDD\n"),
         ],
     )
 
@@ -215,22 +217,23 @@ def test_exception_during_compression_at_rotation_not_caught(freeze_time, tmp_pa
             tmp_path / "test.log",
             format="{message}",
             compression=Mock(side_effect=[OSError("Compression error"), None]),
-            rotation=0,
+            rotation=8,
             catch=False,
             delay=delay,
         )
-        with pytest.raises(OSError, match=r"^Compression error$"):
-            logger.debug("AAA")
-
-        frozen.tick()
+        logger.debug("AAA")
         logger.debug("BBB")
+        frozen.tick()
+        with pytest.raises(OSError, match=r"^Compression error$"):
+            logger.debug("CCC")
+
+        logger.debug("DDD")
 
     check_dir(
         tmp_path,
         files=[
-            ("test.2017-07-01_00-00-00_000000.log", ""),
-            ("test.2017-07-01_00-00-01_000000.log", ""),
-            ("test.log", "BBB\n"),
+            ("test.2017-07-01_00-00-00_000000.log", "AAA\nBBB\n"),
+            ("test.log", "DDD\n"),
         ],
     )
 

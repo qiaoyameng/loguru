@@ -230,7 +230,8 @@ def test_retention_at_rotation(tmp_path, mode):
     tmp_path.joinpath("test.log.2").touch()
     tmp_path.joinpath("test.log.3").touch()
 
-    logger.add(tmp_path / "test.log", retention=1, rotation=0, mode=mode)
+    logger.add(tmp_path / "test.log", retention=1, rotation=4, mode=mode)
+    logger.debug("test")
     logger.debug("test")
 
     check_dir(tmp_path, size=2)
@@ -269,20 +270,20 @@ def test_exception_during_retention_at_rotation(freeze_time, tmp_path, capsys, d
             tmp_path / "test.log",
             format="{message}",
             retention=Mock(side_effect=[Exception("Retention error"), None]),
-            rotation=0,
+            rotation=4,
             catch=True,
             delay=delay,
         )
         logger.debug("AAA")
         frozen.tick()
         logger.debug("BBB")
+        logger.debug("CCC")
 
     check_dir(
         tmp_path,
         files=[
-            ("test.2022-02-22_00-00-00_000000.log", ""),
-            ("test.2022-02-22_00-00-01_000000.log", ""),
-            ("test.log", "BBB\n"),
+            ("test.2022-02-22_00-00-00_000000.log", "AAA\n"),
+            ("test.log", "CCC\n"),
         ],
     )
 
@@ -299,21 +300,21 @@ def test_exception_during_retention_at_rotation_not_caught(freeze_time, tmp_path
             tmp_path / "test.log",
             format="{message}",
             retention=Mock(side_effect=[OSError("Retention error"), None]),
-            rotation=0,
+            rotation=4,
             catch=False,
             delay=delay,
         )
-        with pytest.raises(OSError, match=r"^Retention error$"):
-            logger.debug("AAA")
+        logger.debug("AAA")
         frozen.tick()
-        logger.debug("BBB")
+        with pytest.raises(OSError, match=r"^Retention error$"):
+            logger.debug("BBB")
+        logger.debug("CCC")
 
     check_dir(
         tmp_path,
         files=[
-            ("test.2022-02-22_00-00-00_000000.log", ""),
-            ("test.2022-02-22_00-00-01_000000.log", ""),
-            ("test.log", "BBB\n"),
+            ("test.2022-02-22_00-00-00_000000.log", "AAA\n"),
+            ("test.log", "CCC\n"),
         ],
     )
 

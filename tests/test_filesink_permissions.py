@@ -35,6 +35,7 @@ def test_rotation_permissions(tmp_path, permissions, set_umask):
     logger.add(tmp_path / "file.log", rotation=0, opener=file_permission_opener)
 
     logger.debug("Message")
+    logger.debug("Message")
 
     files = list(tmp_path.iterdir())
     assert len(files) == 2
