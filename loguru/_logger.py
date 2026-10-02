@@ -277,6 +277,7 @@ class Logger:
         level=_defaults.LOGURU_LEVEL,
         format=_defaults.LOGURU_FORMAT,
         filter=_defaults.LOGURU_FILTER,
+        patcher=None,
         colorize=_defaults.LOGURU_COLORIZE,
         serialize=_defaults.LOGURU_SERIALIZE,
         backtrace=_defaults.LOGURU_BACKTRACE,
@@ -301,6 +302,15 @@ class Logger:
         filter : |callable|_, |str| or |dict|, optional
             A directive optionally used to decide for each logged message whether it should be sent
             to the sink or not.
+        patcher : |callable|_, optional
+            A function used to transform a private copy of the log record for this handler. It is
+            called after the level and ``filter`` checks, and before the dynamic ``format``
+            function, the static format, ``serialize``, and the queue used by ``enqueue``.
+            ``message`` and the nested built-in ``dict``, ``list``, ``tuple``, ``set`` and
+            ``bytearray`` values in ``extra`` are isolated from other handlers and from objects
+            passed to |bind| and |contextualize|. Other values, including exceptions, tracebacks,
+            files, threads and processes, are shared references and should be replaced rather
+            than mutated in-place.
         colorize : |bool|, optional
             Whether the color markups contained in the formatted message should be converted to ansi
             codes for terminal coloration, or stripped otherwise. If ``None``, the choice is
@@ -985,6 +995,12 @@ class Logger:
                 % type(filter).__name__
             )
 
+        if patcher is not None and not callable(patcher):
+            raise TypeError(
+                "Invalid patcher, it should be a function or None, not: '%s'"
+                % type(patcher).__name__
+            )
+
         if isinstance(level, str):
             levelno = self.level(level).no
         elif isinstance(level, int):
@@ -1051,6 +1067,7 @@ class Logger:
                 formatter=formatter,
                 is_formatter_dynamic=is_formatter_dynamic,
                 filter_=filter_func,
+                patcher=patcher,
                 colorize=colorize,
                 serialize=serialize,
                 enqueue=enqueue,

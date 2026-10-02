@@ -88,6 +88,10 @@ def patch_function(record):
     record["extra"]["foo"] = "bar"
 
 
+def patcher_function(record):
+    record["extra"]["foo"] = "patcher"
+
+
 def rotation_function(message, file):
     pass
 
@@ -268,6 +272,15 @@ def test_pickling_format_function(capsys, colorize):
     assert err == ""
 
 
+def test_pickling_patcher_function(capsys):
+    logger.add(print_, format="{extra[foo]} {message}", patcher=patcher_function)
+    with copied_logger_though_pickle(logger) as dupe_logger:
+        dupe_logger.info("The message")
+    out, err = capsys.readouterr()
+    assert out == "patcher The message\n"
+    assert err == ""
+
+
 def test_pickling_filter_function_not_serializable():
     logger.add(print, filter=lambda r: True)
     with pytest.raises((pickle.PicklingError, AttributeError), match=r"Can't (pickle|get local)"):
@@ -276,6 +289,12 @@ def test_pickling_filter_function_not_serializable():
 
 def test_pickling_format_function_not_serializable():
     logger.add(print, format=lambda r: "{message}")
+    with pytest.raises((pickle.PicklingError, AttributeError), match=r"Can't (pickle|get local)"):
+        pickle.dumps(logger)
+
+
+def test_pickling_patcher_function_not_serializable():
+    logger.add(print, patcher=lambda r: None)
     with pytest.raises((pickle.PicklingError, AttributeError), match=r"Can't (pickle|get local)"):
         pickle.dumps(logger)
 

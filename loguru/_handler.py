@@ -24,6 +24,57 @@ def memoize(function):
     return functools.lru_cache(maxsize=64)(function)
 
 
+def copy_record(record):
+    record_copy = record.copy()
+    record_copy["extra"] = copy_extra(record["extra"])
+    return record_copy
+
+
+def copy_extra(value, memo=None):
+    if memo is None:
+        memo = {}
+
+    value_id = id(value)
+
+    if isinstance(value, dict):
+        if value_id in memo:
+            return memo[value_id]
+        value_copy = {}
+        memo[value_id] = value_copy
+        value_copy.update(
+            (copy_extra(key, memo), copy_extra(item, memo)) for key, item in value.items()
+        )
+        return value_copy
+
+    if isinstance(value, list):
+        if value_id in memo:
+            return memo[value_id]
+        value_copy = []
+        memo[value_id] = value_copy
+        value_copy.extend(copy_extra(item, memo) for item in value)
+        return value_copy
+
+    if isinstance(value, tuple):
+        if value_id in memo:
+            return memo[value_id]
+        value_copy = tuple(copy_extra(item, memo) for item in value)
+        memo[value_id] = value_copy
+        return value_copy
+
+    if isinstance(value, set):
+        if value_id in memo:
+            return memo[value_id]
+        value_copy = set()
+        memo[value_id] = value_copy
+        value_copy.update(copy_extra(item, memo) for item in value)
+        return value_copy
+
+    if isinstance(value, bytearray):
+        return value[:]
+
+    return value
+
+
 class Message(str):
     __slots__ = ("record",)
 
@@ -38,6 +89,7 @@ class Handler:
         formatter,
         is_formatter_dynamic,
         filter_,
+        patcher,
         colorize,
         serialize,
         enqueue,
@@ -53,6 +105,7 @@ class Handler:
         self._formatter = formatter
         self._is_formatter_dynamic = is_formatter_dynamic
         self._filter = filter_
+        self._patcher = patcher
         self._colorize = colorize
         self._serialize = serialize
         self._enqueue = enqueue
@@ -132,6 +185,10 @@ class Handler:
             if self._filter is not None:
                 if not self._filter(record):
                     return
+
+            if self._patcher is not None:
+                record = copy_record(record)
+                self._patcher(record)
 
             if self._is_formatter_dynamic:
                 dynamic_format = self._formatter(record)
