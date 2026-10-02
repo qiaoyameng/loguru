@@ -119,6 +119,36 @@ class Record(TypedDict):
 class Message(str):
     record: Record
 
+class SinkReceipt:
+    PENDING: str
+    ACCEPTED: str
+    FILTERED: str
+    DROPPED: str
+    SUCCESS: str
+    FAILED: str
+    handler_id: int
+    sink_name: str
+    status: str
+    exception: Optional[BaseException]
+
+class LogReceipt:
+    @property
+    def done(self) -> bool: ...
+    @property
+    def ok(self) -> bool: ...
+    @property
+    def results(self) -> Tuple[SinkReceipt, ...]: ...
+    @property
+    def succeeded(self) -> Tuple[SinkReceipt, ...]: ...
+    @property
+    def failed(self) -> Tuple[SinkReceipt, ...]: ...
+    @property
+    def filtered(self) -> Tuple[SinkReceipt, ...]: ...
+    @property
+    def dropped(self) -> Tuple[SinkReceipt, ...]: ...
+    def wait(self, timeout: Optional[float] = ...) -> LogReceipt: ...
+    def __await__(self) -> Generator[Any, None, LogReceipt]: ...
+
 class Writable(Protocol):
     def write(self, message: Message) -> Any: ...
 
@@ -395,6 +425,18 @@ class Logger:
     ) -> None: ...
     @overload
     def log(__self, __level: Union[int, str], __message: Any) -> None: ...  # noqa: N805
+    @overload
+    def log_with_receipt(
+        __self,  # noqa: N805
+        __level: Union[int, str],
+        __message: LoggedStr,
+        *args: Any,
+        **kwargs: Any
+    ) -> LogReceipt: ...
+    @overload
+    def log_with_receipt(
+        __self, __level: Union[int, str], __message: Any  # noqa: N805
+    ) -> LogReceipt: ...
     def start(self, *args: Any, **kwargs: Any) -> int: ...
     def stop(self, *args: Any, **kwargs: Any) -> None: ...
 

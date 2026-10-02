@@ -1,6 +1,7 @@
 `Unreleased`_
 =============
 
+- Add new ``logger.log_with_receipt()`` method returning a receipt which reports, for each sink selected by the call, whether the record was filtered out, successfully processed or failed with the original exception, including for ``enqueue=True`` and coroutine sinks.
 - Change the default log format to include the timezone offset since it produces less ambiguous logs (`#856 <https://github.com/Delgan/loguru/pull/856>`_, thanks `@tim-x-y-z <https://github.com/tim-x-y-z>`_).
 - Add new ``logger.reinstall()`` method to automatically set up the ``logger`` in spawned child processes (`#818 <https://github.com/Delgan/loguru/issues/818>`_, thanks `@monchin <https://github.com/monchin>`_).
 - Add support for template strings used as log messages (`#1397 <https://github.com/Delgan/loguru/issues/1397>`_, thanks `@TurtleOrangina <https://github.com/TurtleOrangina>`_).

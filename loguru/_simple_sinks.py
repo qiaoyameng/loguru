@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import logging
 import weakref
@@ -140,20 +141,47 @@ class AsyncSink:
         message
             The message to write.
         """
+        self._schedule(message, None)
+
+    def write_with_receipt(self, message, callback):
+        """Asynchronously write a message and report its outcome.
+
+        Parameters
+        ----------
+        message
+            The message to write.
+        callback
+            A function called with ``None`` once the message has been successfully
+            processed by the sink, or with the original exception if it failed.
+        """
+        self._schedule(message, callback)
+
+    def _schedule(self, message, callback):
         try:
             loop = self._loop or get_running_loop()
         except RuntimeError:
+            if callback is not None:
+                callback(
+                    RuntimeError("There is no running event loop to schedule the sink task")
+                )
             return
 
         coroutine = self._function(message)
         task = loop.create_task(coroutine)
 
         def check_exception(future):
-            if future.cancelled() or future.exception() is None:
+            if future.cancelled():
+                if callback is not None:
+                    callback(asyncio.CancelledError("The sink task has been cancelled"))
+                return
+            exception = future.exception()
+            if callback is not None:
+                callback(exception)
+            if exception is None:
                 return
             if not self._error_interceptor.should_catch():
-                raise future.exception()
-            self._error_interceptor.print(message.record, exception=future.exception())
+                raise exception
+            self._error_interceptor.print(message.record, exception=exception)
 
         task.add_done_callback(check_exception)
         self._tasks.add(task)

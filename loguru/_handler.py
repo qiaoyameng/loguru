@@ -3,11 +3,13 @@ import json
 import multiprocessing
 import os
 import threading
+from collections import namedtuple
 from contextlib import contextmanager
 from threading import Thread
 
 from ._colorizer import Colorizer
 from ._locks_machinery import create_handler_lock
+from ._receipt import SinkReceipt
 
 
 def prepare_colored_format(format_, ansi_level):
@@ -22,6 +24,10 @@ def prepare_stripped_format(format_):
 
 def memoize(function):
     return functools.lru_cache(maxsize=64)(function)
+
+
+class _EnqueuedMessage(namedtuple("_EnqueuedMessage", ["message", "token"])):
+    __slots__ = ()
 
 
 class Message(str):
@@ -75,6 +81,8 @@ class Handler:
         self._confirmation_lock = None
         self._owner_process_pid = None
         self._thread = None
+        self._receipts = {}
+        self._receipt_token = 0
 
         if self._is_formatter_dynamic:
             if self._colorize:
@@ -124,13 +132,17 @@ class Handler:
         finally:
             self._lock_acquired.acquired = False
 
-    def emit(self, record, level_id, from_decorator, is_raw, colored_message):
+    def emit(self, record, level_id, from_decorator, is_raw, colored_message, receipt=None):
         try:
             if self._levelno > record["level"].no:
+                if receipt is not None:
+                    receipt._resolve(self._id, SinkReceipt.FILTERED)
                 return
 
             if self._filter is not None:
                 if not self._filter(record):
+                    if receipt is not None:
+                        receipt._resolve(self._id, SinkReceipt.FILTERED)
                     return
 
             if self._is_formatter_dynamic:
@@ -199,12 +211,33 @@ class Handler:
 
             with self._protected_lock():
                 if self._stopped:
+                    if receipt is not None:
+                        receipt._resolve(self._id, SinkReceipt.DROPPED)
                     return
                 if self._enqueue:
-                    self._queue.put(str_record)
+                    if receipt is None:
+                        self._queue.put(str_record)
+                    else:
+                        receipt._accept(self._id)
+                        token = self._receipt_token
+                        self._receipt_token += 1
+                        self._receipts[token] = receipt
+                        try:
+                            self._queue.put(_EnqueuedMessage(str_record, token))
+                        except Exception:
+                            self._receipts.pop(token, None)
+                            raise
                 else:
-                    self._sink.write(str_record)
-        except Exception:
+                    if receipt is not None and hasattr(self._sink, "write_with_receipt"):
+                        receipt._accept(self._id)
+                        self._sink.write_with_receipt(str_record, receipt._callback(self._id))
+                    else:
+                        self._sink.write(str_record)
+                        if receipt is not None:
+                            receipt._resolve(self._id, SinkReceipt.SUCCESS)
+        except Exception as exception:
+            if receipt is not None:
+                receipt._resolve(self._id, SinkReceipt.FAILED, exception)
             if not self._error_interceptor.should_catch():
                 raise
             self._error_interceptor.print(record)
@@ -328,17 +361,35 @@ class Handler:
                 self._confirmation_event.set()
                 continue
 
+            receipt = None
+            if isinstance(message, _EnqueuedMessage):
+                receipt = self._receipts.pop(message.token, None)
+                message = message.message
+
             with lock:
+                if receipt is not None and hasattr(self._sink, "write_with_receipt"):
+                    try:
+                        self._sink.write_with_receipt(message, receipt._callback(self._id))
+                    except Exception as exception:
+                        receipt._resolve(self._id, SinkReceipt.FAILED, exception)
+                        self._error_interceptor.print(message.record)
+                    continue
                 try:
                     self._sink.write(message)
-                except Exception:
+                except Exception as exception:
+                    if receipt is not None:
+                        receipt._resolve(self._id, SinkReceipt.FAILED, exception)
                     self._error_interceptor.print(message.record)
+                else:
+                    if receipt is not None:
+                        receipt._resolve(self._id, SinkReceipt.SUCCESS)
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_lock"] = None
         state["_lock_acquired"] = None
         state["_memoize_dynamic_format"] = None
+        state["_receipts"] = {}
         if self._enqueue:
             state["_sink"] = None
             state["_thread"] = None

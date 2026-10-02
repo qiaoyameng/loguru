@@ -122,6 +122,7 @@ from ._get_frame import get_frame
 from ._handler import Handler
 from ._locks_machinery import create_logger_lock
 from ._recattrs import RecordException, RecordFile, RecordLevel, RecordProcess, RecordThread
+from ._receipt import LogReceipt
 from ._simple_sinks import AsyncSink, CallableSink, StandardSink, StreamSink
 
 if sys.version_info >= (3, 6):
@@ -2056,7 +2057,7 @@ class Logger:
 
         return "".join(item_to_string(item) for item in template)
 
-    def _log(self, level, from_decorator, options, message, args, kwargs):
+    def _log(self, level, from_decorator, options, message, args, kwargs, receipt=None):
         core = self._core
 
         if not core.handlers:
@@ -2080,7 +2081,13 @@ class Logger:
             level_id, level_name, level_no, level_icon = cache
             core.levels_lookup[level] = cache
 
+        if receipt is not None:
+            receipt_handlers = core.handlers
+            receipt._attach(receipt_handlers)
+
         if level_no < core.min_level:
+            if receipt is not None:
+                receipt._filter_all()
             return
 
         exception, depth, record, lazy, colors, raw, capture, patchers, extra = options
@@ -2105,6 +2112,8 @@ class Logger:
 
         try:
             if not core.enabled[name]:
+                if receipt is not None:
+                    receipt._filter_all()
                 return
         except KeyError:
             enabled = core.enabled
@@ -2112,6 +2121,8 @@ class Logger:
                 status = core.activation_none
                 enabled[name] = status
                 if not status:
+                    if receipt is not None:
+                        receipt._filter_all()
                     return
             else:
                 dotted_name = name + "."
@@ -2120,6 +2131,8 @@ class Logger:
                         if status:
                             break
                         enabled[name] = False
+                        if receipt is not None:
+                            receipt._filter_all()
                         return
                 enabled[name] = True
 
@@ -2195,8 +2208,13 @@ class Logger:
         for patcher in patchers:
             patcher(log_record)
 
-        for handler in core.handlers.values():
-            handler.emit(log_record, level_id, from_decorator, raw, colored_message)
+        if receipt is not None:
+            for handler in receipt_handlers.values():
+                handler.emit(log_record, level_id, from_decorator, raw, colored_message, receipt)
+            receipt._seal()
+        else:
+            for handler in core.handlers.values():
+                handler.emit(log_record, level_id, from_decorator, raw, colored_message)
 
     def trace(__self, __message, *args, **kwargs):  # noqa: N805
         r"""Log ``message.format(*args, **kwargs)`` with severity ``'TRACE'``."""
@@ -2243,6 +2261,64 @@ class Logger:
         one and displayed as such (see also |FAQ anonymous levels| for more details).
         """
         __self._log(__level, False, __self._options, __message, args, kwargs)
+
+    def log_with_receipt(__self, __level, __message, *args, **kwargs):  # noqa: N805
+        r"""Log ``message.format(*args, **kwargs)`` with severity ``level`` and return a receipt.
+
+        Contrary to the standard logging methods (such as |logger.info|), which are optimized
+        to be as cheap as possible and return nothing, this method explicitly requests a
+        delivery receipt for the logged record. It should be used when the caller needs to
+        know whether the record was actually processed by the configured sinks.
+
+        The returned receipt aggregates one entry per handler selected for this very call
+        (the handlers configured at the time of the call). Each entry identifies the sink by
+        its handler id (as returned by |add|) and name, and converges to a final status:
+
+        - ``"success"`` if the sink finished processing the record.
+        - ``"failed"`` if the sink raised an exception, which is attached to the entry.
+        - ``"filtered"`` if the sink did not accept the record because of its level or
+          filter configuration.
+        - ``"dropped"`` if the record could not be delivered to the sink (for example
+          because the handler was concurrently removed).
+
+        For handlers configured with ``enqueue=True``, the entry is only resolved once the
+        internal writer thread actually processed the record: being enqueued is reported as
+        ``"accepted"`` and is not considered a success. For coroutine sinks, the entry is
+        resolved once the scheduled task completes.
+
+        The receipt can be waited for synchronously with ``receipt.wait(timeout)`` or
+        awaited with ``await receipt``. Timing out or cancelling the wait does not discard
+        the record: it remains accepted by the sinks and the receipt can be waited on again.
+
+        Note that a successful receipt only means the sink finished processing the record.
+        It does **not** guarantee that the logged data has been persisted to any external
+        storage, database or remote endpoint.
+
+        Parameters
+        ----------
+        __level : |int| or |str|
+            The severity level of the logged message.
+        __message : |str|
+            The message to log, possibly formatted with ``args`` and ``kwargs``.
+
+        Returns
+        -------
+        ``LogReceipt``
+            The receipt tracking the outcome of the record for each selected sink.
+
+        Examples
+        --------
+        >>> logger.add(sys.stderr)
+        1
+        >>> receipt = logger.log_with_receipt("INFO", "Processing item {}", 42)
+        >>> receipt.wait(timeout=5)
+        LogReceipt(...)
+        >>> receipt.ok
+        True
+        """
+        receipt = LogReceipt()
+        __self._log(__level, False, __self._options, __message, args, kwargs, receipt=receipt)
+        return receipt
 
     def start(self, *args, **kwargs):
         """Add a handler sending log messages to a sink adequately configured.
