@@ -284,6 +284,7 @@ class Logger:
         enqueue=_defaults.LOGURU_ENQUEUE,
         context=_defaults.LOGURU_CONTEXT,
         catch=_defaults.LOGURU_CATCH,
+        patcher=None,
         **kwargs
     ):
         r"""Add a handler sending log messages to a sink adequately configured.
@@ -326,6 +327,18 @@ class Logger:
             Whether errors occurring while sink handles logs messages should be automatically
             caught. If ``True``, an exception message is displayed on |sys.stderr| but the exception
             is not propagated to the caller, preventing your app to crash.
+        patcher : |callable|_, optional
+            A function used to transform the log record for this handler only, called with the
+            record as its sole parameter. It is executed once per logged message, after the
+            ``filter`` but before any formatting (including a dynamic ``format`` function),
+            serialization and enqueuing. The record it receives is an isolated copy: the
+            dictionary itself and its ``"extra"`` mapping (deep-copied) may be freely modified
+            without affecting other handlers nor the objects passed to |bind| or |contextualize|.
+            Other record values (``"exception"``, ``"file"``, ``"thread"``, ``"process"``,
+            ``"level"``, ``"elapsed"``, ``"time"``, ...) are shared between handlers and must be
+            treated as read-only, as they are not guaranteed to support ``copy.deepcopy()``. If the
+            ``patcher`` raises an exception, the message is not sent to this sink and the error
+            is handled according to the ``catch`` parameter, without impacting other handlers.
         **kwargs
             Additional parameters that are only valid to configure a coroutine or file sink (see
             below).
@@ -1000,6 +1013,11 @@ class Logger:
                 "Invalid level value, it should be a positive integer, not: %d" % levelno
             )
 
+        if patcher is not None and not callable(patcher):
+            raise TypeError(
+                "Invalid patcher, it should be a function, not: '%s'" % type(patcher).__name__
+            )
+
         if isinstance(format, str):
             try:
                 formatter = Colorizer.prepare_format(format + terminator + "{exception}")
@@ -1051,6 +1069,7 @@ class Logger:
                 formatter=formatter,
                 is_formatter_dynamic=is_formatter_dynamic,
                 filter_=filter_func,
+                patcher=patcher,
                 colorize=colorize,
                 serialize=serialize,
                 enqueue=enqueue,

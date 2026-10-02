@@ -4,6 +4,7 @@ import multiprocessing
 import os
 import threading
 from contextlib import contextmanager
+from copy import deepcopy
 from threading import Thread
 
 from ._colorizer import Colorizer
@@ -38,6 +39,7 @@ class Handler:
         formatter,
         is_formatter_dynamic,
         filter_,
+        patcher,
         colorize,
         serialize,
         enqueue,
@@ -53,6 +55,7 @@ class Handler:
         self._formatter = formatter
         self._is_formatter_dynamic = is_formatter_dynamic
         self._filter = filter_
+        self._patcher = patcher
         self._colorize = colorize
         self._serialize = serialize
         self._enqueue = enqueue
@@ -132,6 +135,9 @@ class Handler:
             if self._filter is not None:
                 if not self._filter(record):
                     return
+
+            if self._patcher is not None:
+                record = self._patched_record(record)
 
             if self._is_formatter_dynamic:
                 dynamic_format = self._formatter(record)
@@ -264,6 +270,21 @@ class Handler:
                 "To include custom data, use 'logger.bind(key=value)' and reference it "
                 "as '{extra[key]}' in the format string." % (e, log_format, available)
             ) from e
+
+    def _patched_record(self, record):
+        """Return an isolated copy of the record with the handler's patcher applied.
+
+        The record dict and its "extra" mapping are copied so that the patcher can freely
+        modify them, including nested "extra" values, without affecting other handlers nor
+        the objects passed by the caller to "bind()" or "contextualize()". The remaining
+        values ("exception", "file", "thread", "process", "level", "elapsed", "time", ...)
+        are shared by reference and must be treated as read-only by the patcher, as they
+        are not guaranteed to support "deepcopy()".
+        """
+        patched = record.copy()
+        patched["extra"] = deepcopy(record["extra"])
+        self._patcher(patched)
+        return patched
 
     @staticmethod
     def _serialize_record(text, record):

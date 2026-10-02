@@ -1,6 +1,7 @@
 `Unreleased`_
 =============
 
+- Add new ``patcher`` parameter to ``logger.add()`` allowing the log record to be transformed independently for each handler before formatting, without affecting other handlers nor the objects passed to ``bind()`` and ``contextualize()``.
 - Change the default log format to include the timezone offset since it produces less ambiguous logs (`#856 <https://github.com/Delgan/loguru/pull/856>`_, thanks `@tim-x-y-z <https://github.com/tim-x-y-z>`_).
 - Add new ``logger.reinstall()`` method to automatically set up the ``logger`` in spawned child processes (`#818 <https://github.com/Delgan/loguru/issues/818>`_, thanks `@monchin <https://github.com/monchin>`_).
 - Add support for template strings used as log messages (`#1397 <https://github.com/Delgan/loguru/issues/1397>`_, thanks `@TurtleOrangina <https://github.com/TurtleOrangina>`_).

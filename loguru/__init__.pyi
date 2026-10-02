@@ -137,6 +137,7 @@ class BasicHandlerConfig(TypedDict, total=False):
     level: Union[str, int]
     format: Union[str, FormatFunction]
     filter: Optional[Union[str, FilterFunction, FilterDict]]
+    patcher: Optional[PatcherFunction]
     colorize: Optional[bool]
     serialize: bool
     backtrace: bool
@@ -149,6 +150,7 @@ class FileHandlerConfig(TypedDict, total=False):
     level: Union[str, int]
     format: Union[str, FormatFunction]
     filter: Optional[Union[str, FilterFunction, FilterDict]]
+    patcher: Optional[PatcherFunction]
     colorize: Optional[bool]
     serialize: bool
     backtrace: bool
@@ -182,6 +184,7 @@ class AsyncHandlerConfig(TypedDict, total=False):
     level: Union[str, int]
     format: Union[str, FormatFunction]
     filter: Optional[Union[str, FilterFunction, FilterDict]]
+    patcher: Optional[PatcherFunction]
     colorize: Optional[bool]
     serialize: bool
     backtrace: bool
@@ -210,6 +213,7 @@ class Logger:
         level: Union[str, int] = ...,
         format: Union[str, FormatFunction] = ...,
         filter: Optional[Union[str, FilterFunction, FilterDict]] = ...,
+        patcher: Optional[PatcherFunction] = ...,
         colorize: Optional[bool] = ...,
         serialize: bool = ...,
         backtrace: bool = ...,
@@ -226,6 +230,7 @@ class Logger:
         level: Union[str, int] = ...,
         format: Union[str, FormatFunction] = ...,
         filter: Optional[Union[str, FilterFunction, FilterDict]] = ...,
+        patcher: Optional[PatcherFunction] = ...,
         colorize: Optional[bool] = ...,
         serialize: bool = ...,
         backtrace: bool = ...,
@@ -243,6 +248,7 @@ class Logger:
         level: Union[str, int] = ...,
         format: Union[str, FormatFunction] = ...,
         filter: Optional[Union[str, FilterFunction, FilterDict]] = ...,
+        patcher: Optional[PatcherFunction] = ...,
         colorize: Optional[bool] = ...,
         serialize: bool = ...,
         backtrace: bool = ...,
