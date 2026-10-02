@@ -1,3 +1,4 @@
+import codecs
 import datetime
 import decimal
 import glob
@@ -65,6 +66,41 @@ class Compression:
             os.rename(path_out, renamed_path)
         compress_function(path_in, path_out)
         os.remove(path_in)
+
+
+class ByteBudget:
+    """A rotation policy based on the exact number of bytes written to the file.
+
+    Contrary to a plain size limit (which compares the number of characters of each
+    logged message), this policy accounts for the actual bytes produced by the encoding
+    process. This includes the BOM possibly emitted by stateful encodings such as
+    "utf-16" or "utf-8-sig", the newline terminating each record, and the size of a
+    pre-existing file opened in append mode.
+
+    A record is never split: if the next record would make the file exceed the budget,
+    the file is rotated beforehand. A single record larger than the budget is written
+    whole to the current file (a file which received no record yet is never rotated),
+    which guarantees that rotation can neither loop indefinitely nor produce empty
+    files.
+    """
+
+    def __init__(self, size_limit):
+        if isinstance(size_limit, str):
+            size = string_parsers.parse_size(size_limit)
+            if size is None:
+                raise ValueError("Cannot parse byte budget from: '%s'" % size_limit)
+            size_limit = size
+        if not isinstance(size_limit, (numbers.Real, decimal.Decimal)):
+            raise TypeError(
+                "Cannot infer byte budget for objects of type: '%s'"
+                % type(size_limit).__name__
+            )
+        if size_limit <= 0:
+            raise ValueError("The byte budget must be strictly positive")
+        self.size_limit = size_limit
+
+    def __repr__(self):
+        return "ByteBudget(%r)" % (self.size_limit,)
 
 
 class Retention:
@@ -185,6 +221,11 @@ class FileSink:
         self._kwargs = {**kwargs, "mode": mode, "buffering": buffering, "encoding": self.encoding}
         self._path = str(path)
 
+        self._byte_limit = None
+        if isinstance(rotation, ByteBudget):
+            self._byte_limit = rotation.size_limit
+            rotation = None
+
         self._glob_patterns = self._make_glob_patterns(self._path)
         self._rotation_function = self._make_rotation_function(rotation)
         self._retention_function = self._make_retention_function(retention)
@@ -192,6 +233,11 @@ class FileSink:
 
         self._file = None
         self._file_path = None
+
+        self._byte_count = 0
+        self._byte_initial = 0
+        self._byte_record_count = 0
+        self._byte_encoder = None
 
         self._watch = watch
         self._file_dev = -1
@@ -211,10 +257,75 @@ class FileSink:
         if self._watch:
             self._reopen_if_needed()
 
+        if self._byte_limit is not None:
+            self._write_within_byte_budget(message)
+            return
+
         if self._rotation_function is not None and self._rotation_function(message, self._file):
             self._terminate_file(is_rotating=True)
 
         self._file.write(message)
+
+    def _write_within_byte_budget(self, message):
+        size = self._measure_message(message)
+
+        if self._byte_count + size > self._byte_limit and (
+            self._byte_record_count > 0 or self._byte_initial > 0
+        ):
+            # The current file holds at least one record (or pre-existing content), so
+            # rotating it away can neither produce an empty file nor loop indefinitely.
+            # A record larger than the budget on its own is hence written whole to a
+            # fresh file, and rotation is deferred to the next record.
+            self._terminate_file(is_rotating=True)
+            size = self._measure_message(message)
+
+        try:
+            self._file.write(message)
+        except Exception:
+            self._resync_byte_tracker()
+            raise
+
+        self._byte_count += size
+        self._byte_record_count += 1
+
+    def _measure_message(self, message):
+        # A dedicated incremental encoder mirrors the one of the file, so the exact
+        # amount of bytes a message will add (including BOM or state shifts) is known
+        # upfront, without trial-encoding through the stateful encoder of the file itself.
+        try:
+            return len(self._byte_encoder.encode(message))
+        except Exception:
+            self._resync_byte_tracker()
+            raise
+
+    def _init_byte_tracker(self):
+        self._file.seek(0, os.SEEK_END)
+        self._byte_count = self._file.tell()
+        self._byte_initial = self._byte_count
+        self._byte_record_count = 0
+        errors = self._file.errors or "strict"
+        self._byte_encoder = codecs.getincrementalencoder(self._file.encoding)(errors)
+        if self._byte_count > 0:
+            # The encoder of the file does not emit its preamble (e.g. the BOM of
+            # "utf-16") while appending to a non-empty file, so the preamble of the
+            # shadow encoder is consumed upfront to keep both encoders aligned.
+            self._byte_encoder.encode("")
+
+    def _resync_byte_tracker(self):
+        # Recover byte accounting from the actual file state after an encoding or
+        # write error, so that subsequent records keep being measured accurately.
+        try:
+            self._file.seek(0, os.SEEK_END)
+            self._byte_count = self._file.tell()
+        except Exception:
+            pass
+        errors = self._file.errors or "strict"
+        encoder = codecs.getincrementalencoder(self._file.encoding)(errors)
+        if self._byte_count > 0:
+            # The encoder of the file already emitted its preamble (or will not emit
+            # it because the file is not empty), consume it to stay aligned.
+            encoder.encode("")
+        self._byte_encoder = encoder
 
     def stop(self):
         if self._watch:
@@ -243,6 +354,9 @@ class FileSink:
             self._file_dev = result[ST_DEV]
             self._file_ino = result[ST_INO]
 
+        if self._byte_limit is not None:
+            self._init_byte_tracker()
+
     def _close_file(self):
         self._file.flush()
         self._file.close()
@@ -251,6 +365,7 @@ class FileSink:
         self._file_path = None
         self._file_dev = -1
         self._file_ino = -1
+        self._byte_encoder = None
 
     def _reopen_if_needed(self):
         # Implemented based on standard library:
@@ -287,7 +402,9 @@ class FileSink:
                 os.rename(old_path, renamed_path)
                 old_path = renamed_path
 
-        if is_rotating or self._rotation_function is None:
+        has_rotation = self._rotation_function is not None or self._byte_limit is not None
+
+        if is_rotating or not has_rotation:
             if self._compression_function is not None and old_path is not None:
                 self._compression_function(old_path)
 

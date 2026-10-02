@@ -52,6 +52,8 @@ if sys.version_info >= (3, 14):
 else:
     LoggedStr = str
 
+from ._file_sink import ByteBudget as ByteBudget
+
 _T = TypeVar("_T")
 _F = TypeVar("_F", bound=Callable[..., Any])
 ExcInfo = Tuple[Optional[Type[BaseException]], Optional[BaseException], Optional[TracebackType]]
@@ -161,6 +163,7 @@ class FileHandlerConfig(TypedDict, total=False):
             int,
             time,
             timedelta,
+            ByteBudget,
             RotationFunction,
             list[Union[str, int, time, timedelta, RotationFunction]],
         ]
@@ -256,6 +259,7 @@ class Logger:
                 int,
                 time,
                 timedelta,
+                ByteBudget,
                 RotationFunction,
                 list[Union[str, int, time, timedelta, RotationFunction]],
             ]

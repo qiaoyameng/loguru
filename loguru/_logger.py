@@ -345,8 +345,8 @@ class Logger:
 
         Parameters
         ----------
-        rotation : |str|, |int|, |time|, |timedelta|, |callable|_, or |list| of any of those
-            types, optional
+        rotation : |str|, |int|, |time|, |timedelta|, ``ByteBudget``, |callable|_, or |list| of
+            any of those types, optional
             Condition(s) indicating whenever the current logged file should be closed and a
             new one started. If a list of conditions are provided, the current file is rotated
             if any condition is true.
@@ -660,6 +660,13 @@ class Logger:
         - a |callable|_ which will be invoked before logging. It should accept two arguments: the
           logged message and the file object, and it should return ``True`` if the rotation should
           happen now, ``False`` otherwise.
+        - a ``ByteBudget`` instance (e.g. ``rotation=ByteBudget("100 MB")``) to rotate based on
+          the exact number of bytes written to the file. Unlike a plain size limit, which counts
+          the characters of each message, this accounts for the actual encoded bytes, including
+          the BOM of stateful encodings such as ``"utf-16"``, the newline terminating each record
+          and the size of a pre-existing file opened in append mode. A record is never split: if
+          it would exceed the remaining budget, the file is rotated beforehand. A single record
+          larger than the whole budget is written entirely to its own file.
 
         The ``retention`` occurs at rotation or at sink stop if rotation is ``None``. Files
         resulting from previous sessions or rotations are automatically collected from disk. A file
