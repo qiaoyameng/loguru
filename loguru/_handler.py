@@ -44,6 +44,7 @@ class Handler:
         multiprocessing_context,
         error_interceptor,
         exception_formatter,
+        suppressor,
         id_,
         levels_ansi_codes
     ):
@@ -59,6 +60,7 @@ class Handler:
         self._multiprocessing_context = multiprocessing_context
         self._error_interceptor = error_interceptor
         self._exception_formatter = exception_formatter
+        self._suppressor = suppressor
         self._id = id_
         self._levels_ansi_codes = levels_ansi_codes  # Warning, reference shared among handlers
 
@@ -200,18 +202,31 @@ class Handler:
             with self._protected_lock():
                 if self._stopped:
                     return
-                if self._enqueue:
-                    self._queue.put(str_record)
+                if self._suppressor is not None:
+                    for message in self._suppressor.offer(str_record):
+                        self._write(message)
                 else:
-                    self._sink.write(str_record)
+                    self._write(str_record)
         except Exception:
             if not self._error_interceptor.should_catch():
                 raise
             self._error_interceptor.print(record)
 
+    def _write(self, message):
+        # Must be called with the handler lock acquired. When the sink is
+        # enqueued, grouping happens here on the sender side, before messages
+        # reach the queue.
+        if self._enqueue:
+            self._queue.put(message)
+        else:
+            self._sink.write(message)
+
     def stop(self):
         with self._protected_lock():
             self._stopped = True
+            if self._suppressor is not None:
+                for message in self._suppressor.flush():
+                    self._write(message)
             if self._enqueue:
                 if self._owner_process_pid != os.getpid():
                     return

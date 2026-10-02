@@ -4,6 +4,7 @@
    be used in the ``Logger`` docstrings but do not pollute ``help(logger)`` output.
 
 .. |Logger| replace:: :class:`~Logger`
+.. |SuppressionPolicy| replace:: :class:`~loguru._suppression.SuppressionPolicy`
 .. |add| replace:: :meth:`~Logger.add()`
 .. |remove| replace:: :meth:`~Logger.remove()`
 .. |complete| replace:: :meth:`~Logger.complete()`
@@ -105,6 +106,7 @@ import sys
 import threading
 import warnings
 from collections import namedtuple
+from datetime import timedelta
 from inspect import isclass, iscoroutinefunction, isgeneratorfunction
 from multiprocessing import current_process, get_context
 from multiprocessing.context import BaseContext
@@ -123,6 +125,7 @@ from ._handler import Handler
 from ._locks_machinery import create_logger_lock
 from ._recattrs import RecordException, RecordFile, RecordLevel, RecordProcess, RecordThread
 from ._simple_sinks import AsyncSink, CallableSink, StandardSink, StreamSink
+from ._suppression import DuplicateSuppressor, SuppressionPolicy
 
 if sys.version_info >= (3, 6):
     from collections.abc import AsyncGenerator
@@ -284,6 +287,7 @@ class Logger:
         enqueue=_defaults.LOGURU_ENQUEUE,
         context=_defaults.LOGURU_CONTEXT,
         catch=_defaults.LOGURU_CATCH,
+        suppress=None,
         **kwargs
     ):
         r"""Add a handler sending log messages to a sink adequately configured.
@@ -326,6 +330,15 @@ class Logger:
             Whether errors occurring while sink handles logs messages should be automatically
             caught. If ``True``, an exception message is displayed on |sys.stderr| but the exception
             is not propagated to the caller, preventing your app to crash.
+        suppress : |SuppressionPolicy|, |dict|, |int|, |float|, |str|, |timedelta| or \
+                ``None``, optional
+            A duplicate suppression policy applied to this sink only. The first occurrence of a
+            log record is emitted normally, while subsequent records sharing the same fingerprint
+            are counted during a time window, after which a summary (with the suppressed count
+            and the covered time range) is emitted. This accepts a |SuppressionPolicy| instance,
+            a |dict| of keyword arguments used to build one, or simply a window duration (a
+            number of seconds, a duration string like ``"1 min"`` or a |timedelta|). If ``None``
+            (the default), suppression is disabled and every record is sent to the sink.
         **kwargs
             Additional parameters that are only valid to configure a coroutine or file sink (see
             below).
@@ -442,6 +455,28 @@ class Logger:
         ``True`` and ``False`` to respectively authorize and discard all module logs
         unconditionally. In order to set a default level, the ``""`` module name should be used as
         it is the parent of all modules (it does not suppress global ``level`` threshold, though).
+
+        .. _suppress:
+
+        .. rubric:: Duplicate suppression
+
+        The ``suppress`` attribute can be used to prevent a burst of identical errors from
+        flooding a sink. Each sink owns an independent suppression state, configured through
+        a |SuppressionPolicy|. Within a window opened by the first record of a group, duplicates
+        (records with the same fingerprint) are counted instead of being written. When the
+        window expires, a single summary message reporting the suppressed count and the time
+        range of the grouped records is emitted. Summaries are emitted lazily (when the next
+        record is processed) and any still-pending count is reported when the sink is removed.
+        The default fingerprint groups records by level, message and exception type: a change
+        of level or a different exception type starts a new group. A custom ``fingerprint``
+        function can be provided, it must treat the record as read-only. The number of tracked
+        groups is bounded by ``max_groups`` and the least recently used group is evicted (and
+        reported) when the limit is reached. Only the first record of each group is retained,
+        suppressed records are counted but not stored. The ``clock`` used to measure windows
+        can be injected, which is convenient for testing. When ``enqueue=True``, grouping
+        happens on the sender side, before messages are put into the queue. Summary messages
+        are written directly to the sink and never re-enter the suppressor, so they cannot be
+        recursively suppressed.
 
         Note that while calling a logging method, the keyword arguments (if any) are automatically
         added to the ``extra`` dict for convenient contextualization (in addition to being used for
@@ -1034,6 +1069,22 @@ class Logger:
                 "not: '%s'" % type(context).__name__
             )
 
+        if suppress is None:
+            suppressor = None
+        else:
+            if isinstance(suppress, SuppressionPolicy):
+                policy = suppress
+            elif isinstance(suppress, dict):
+                policy = SuppressionPolicy(**suppress)
+            elif isinstance(suppress, (int, float, str, timedelta)):
+                policy = SuppressionPolicy(window=suppress)
+            else:
+                raise TypeError(
+                    "Invalid suppress, it should be a SuppressionPolicy, a dict of options, "
+                    "a window duration or None, not: '%s'" % type(suppress).__name__
+                )
+            suppressor = DuplicateSuppressor(policy)
+
         with self._core.lock:
             exception_formatter = ExceptionFormatter(
                 colorize=colorize,
@@ -1058,6 +1109,7 @@ class Logger:
                 id_=handler_id,
                 error_interceptor=error_interceptor,
                 exception_formatter=exception_formatter,
+                suppressor=suppressor,
                 levels_ansi_codes=self._core.levels_ansi_codes,
             )
 

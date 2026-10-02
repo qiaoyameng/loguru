@@ -129,6 +129,20 @@ PatcherFunction = Callable[[Record], None]
 RotationFunction = Callable[[Message, TextIO], bool]
 RetentionFunction = Callable[[List[str]], None]
 CompressionFunction = Callable[[str], None]
+FingerprintFunction = Callable[[Record], Any]
+SummaryFormatFunction = Callable[[Dict[str, Any]], str]
+SuppressOption = Union["SuppressionPolicy", Dict[str, Any], int, float, str, timedelta]
+
+class SuppressionPolicy:
+    def __init__(
+        self,
+        window: Union[int, float, str, timedelta],
+        *,
+        max_groups: int = ...,
+        fingerprint: Optional[FingerprintFunction] = ...,
+        clock: Optional[Callable[[], float]] = ...,
+        summary_format: Optional[SummaryFormatFunction] = ...,
+    ) -> None: ...
 
 StandardOpener = Callable[[str, int], int]
 
@@ -143,6 +157,7 @@ class BasicHandlerConfig(TypedDict, total=False):
     diagnose: bool
     enqueue: bool
     catch: bool
+    suppress: Optional[SuppressOption]
 
 class FileHandlerConfig(TypedDict, total=False):
     sink: Union[str, PathLikeStr]
@@ -176,6 +191,7 @@ class FileHandlerConfig(TypedDict, total=False):
     newline: Optional[str]
     closefd: bool
     opener: Optional[StandardOpener]
+    suppress: Optional[SuppressOption]
 
 class AsyncHandlerConfig(TypedDict, total=False):
     sink: Callable[[Message], Awaitable[None]]
@@ -190,6 +206,7 @@ class AsyncHandlerConfig(TypedDict, total=False):
     catch: bool
     context: Optional[Union[str, BaseContext]]
     loop: Optional[AbstractEventLoop]
+    suppress: Optional[SuppressOption]
 
 HandlerConfig = Union[BasicHandlerConfig, FileHandlerConfig, AsyncHandlerConfig]
 
@@ -216,7 +233,8 @@ class Logger:
         diagnose: bool = ...,
         enqueue: bool = ...,
         context: Optional[Union[str, BaseContext]] = ...,
-        catch: bool = ...
+        catch: bool = ...,
+        suppress: Optional[SuppressOption] = ...
     ) -> int: ...
     @overload
     def add(
@@ -233,7 +251,8 @@ class Logger:
         enqueue: bool = ...,
         catch: bool = ...,
         context: Optional[Union[str, BaseContext]] = ...,
-        loop: Optional[AbstractEventLoop] = ...
+        loop: Optional[AbstractEventLoop] = ...,
+        suppress: Optional[SuppressOption] = ...
     ) -> int: ...
     @overload
     def add(
@@ -271,6 +290,7 @@ class Logger:
         newline: Optional[str] = ...,
         closefd: bool = ...,
         opener: Optional[StandardOpener] = ...,
+        suppress: Optional[SuppressOption] = ...,
     ) -> int: ...
     def remove(self, handler_id: Optional[int] = ...) -> None: ...
     def complete(self) -> AwaitableCompleter: ...
